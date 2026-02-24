@@ -250,12 +250,24 @@ export function parseComponentDescription(description: string): ParsedDescriptio
 		{ pattern: /^variants$/i, section: "other" },
 	];
 
+	// Detect Figma per-property documentation headers like:
+	// "Show Left Icon: True – Purpose", "Badge Text – Purpose", "Nested Instance: Checkbox – Purpose"
+	const propertyDocPattern = /[–-]\s*Purpose\s*$/i;
+
 	for (const line of lines) {
 		const trimmed = line.trim();
 
 		// Detect section headers: bold text (**Header**), markdown headers (## Header), or plain text exact matches
 		const markdownHeaderMatch = trimmed.match(/^(?:\*\*|###?\s*)(.+?)(?:\*\*)?$/);
 		const headerText = markdownHeaderMatch ? markdownHeaderMatch[1].trim().replace(/\*\*/g, "") : null;
+
+		// Check if this is a Figma per-property documentation block (e.g., "Show Left Icon: True – Purpose")
+		// These should be routed to "other" to avoid polluting content guidelines and accessibility sections
+		const rawTextForPropertyCheck = headerText || trimmed;
+		if (propertyDocPattern.test(rawTextForPropertyCheck)) {
+			currentSection = "other";
+			continue;
+		}
 
 		// Check plain-text headers first (exact line matches for known patterns)
 		let plainMatch: { section: Section; heading: string } | null = null;
@@ -1479,7 +1491,7 @@ function generateFrontmatter(
 	const lines = [
 		"---",
 		`title: ${componentName}`,
-		`description: ${description.replace(/\n/g, " ").slice(0, 200) || `${componentName} component`}`,
+		`description: ${(description.split(/(?:When to Use|When NOT to Use|Variants|Content Requirements|Accessibility)/i)[0] || description).replace(/\n/g, " ").replace(/\s+/g, " ").trim() || `${componentName} component`}`,
 		`status: ${status}`,
 		`version: ${version}`,
 		`category: components`,
@@ -1518,6 +1530,13 @@ function generateOverviewSection(
 	const links: string[] = [`**[Open in Figma](${fileUrl})**`];
 	if (codeInfo?.filePath) {
 		links.push(`**[View Source](${codeInfo.filePath})**`);
+	}
+	// Add Storybook link if stories file exists in sourceFiles
+	const storiesFile = codeInfo?.sourceFiles?.find(
+		(f) => f.role.toLowerCase().includes("storybook") || f.role.toLowerCase().includes("stories") || f.path.includes(".stories."),
+	);
+	if (storiesFile) {
+		links.push(`**[Storybook](${storiesFile.path})**`);
 	}
 	lines.push(links.join(" | "));
 	lines.push("");
@@ -1605,15 +1624,15 @@ function generateStatesAndVariantsSection(
 		const hasFills = variantData.some((v) => v.fills.length > 0);
 
 		if (hasFills || hasIcons) {
-			const headerParts = ["| Variant", "Background"];
+			const headerParts = ["Variant", "Background"];
 			if (hasIcons) headerParts.push("Icon");
-			headerParts.push("Text/Icon Color", "|");
-			lines.push(headerParts.join(" | "));
+			headerParts.push("Text/Icon Color");
+			lines.push("| " + headerParts.join(" | ") + " |");
 
-			const separatorParts = ["|--------", "----------"];
+			const separatorParts = ["--------", "----------"];
 			if (hasIcons) separatorParts.push("----");
-			separatorParts.push("---------------|");
-			lines.push(separatorParts.join("|"));
+			separatorParts.push("---------------");
+			lines.push("|" + separatorParts.join("|") + "|");
 
 			for (const vd of variantData) {
 				const displayName = cleanVariantName(vd.variantName);
@@ -1630,13 +1649,13 @@ function generateStatesAndVariantsSection(
 					? (textColor.variableName ? `\`${textColor.variableName}\` (${textColor.hex})` : textColor.hex)
 					: "—";
 
-				const rowParts = [`| **${displayName}**`, bgVal];
+				const rowParts = [`**${displayName}**`, bgVal];
 				if (hasIcons) {
 					const icon = vd.icons[0]?.name || "—";
 					rowParts.push(icon);
 				}
-				rowParts.push(textVal + " |");
-				lines.push(rowParts.join(" | "));
+				rowParts.push(textVal);
+				lines.push("| " + rowParts.join(" | ") + " |");
 			}
 			lines.push("");
 		}

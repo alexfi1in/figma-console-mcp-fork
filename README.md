@@ -7,7 +7,7 @@
 
 > **Your design system as an API.** Model Context Protocol server that bridges design and development—giving AI assistants complete access to Figma for **extraction**, **creation**, and **debugging**.
 
-> **🆕 v1.11.0 — CDP Removed, Smarter Multi-File:** All CDP references removed (Figma blocked it). Active file now tracks your focused tab across multiple open projects. [See changelog →](CHANGELOG.md)
+> **🆕 v1.11.1 — Doc Generator Fixes:** Cleaner `figma_generate_component_doc` output—proper markdown tables, filtered property metadata, Storybook links. [See changelog →](CHANGELOG.md)
 
 ## What is this?
 
@@ -651,9 +651,10 @@ The architecture supports adding new apps with minimal boilerplate — each app 
 
 ## 🛤️ Roadmap
 
-**Current Status:** v1.11.0 (Stable) - Production-ready with WebSocket-only connectivity, smart multi-file tracking, 56+ tools, Comments API, and MCP Apps
+**Current Status:** v1.11.1 (Stable) - Production-ready with WebSocket-only connectivity, smart multi-file tracking, 56+ tools, Comments API, and MCP Apps
 
 **Recent Releases:**
+- [x] **v1.11.1** - Doc generator fixes: clean markdown tables, Storybook links, property metadata filtering
 - [x] **v1.11.0** - Complete CDP removal, improved multi-file active tracking with focus detection
 - [x] **v1.10.0** - Multi-instance support (dynamic port fallback 9223–9232, multi-connection plugin, instance discovery)
 - [x] **v1.9.0** - Figma Comments tools, improved port conflict detection

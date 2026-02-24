@@ -5,6 +5,16 @@ All notable changes to Figma Console MCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.1] - 2026-02-24
+
+### Fixed
+- **Frontmatter description overflow in `figma_generate_component_doc`** — When Figma descriptions contained multiple sections (overview, When to Use, Variants, etc.), the entire blob was dumped into the YAML `description` field. Now extracts only the overview paragraph.
+- **Malformed Variant Matrix markdown tables** — Table rows were missing leading/trailing pipe characters, producing invalid markdown. Tables now render correctly in all markdown viewers.
+- **Property metadata leaking into Content Guidelines and Accessibility sections** — Figma per-property documentation blocks (e.g., "Show Left Icon: True – Purpose") were being parsed into content and accessibility sections instead of being filtered out. Added pattern detection to route these to the discard bucket.
+
+### Added
+- **Storybook link in generated docs** — When `codeInfo.sourceFiles` includes a Storybook stories file, a `[View Storybook]` link is added to the doc header alongside Open in Figma and View Source.
+
 ## [1.11.0] - 2026-02-22
 
 ### Changed

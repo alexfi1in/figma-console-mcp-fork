@@ -47,6 +47,11 @@
       "name": "Changelog",
       "icon": "clock-rotate-left",
       "url": "https://github.com/southleft/figma-console-mcp/blob/main/CHANGELOG.md"
+    },
+    {
+      "name": "Sponsor",
+      "icon": "heart",
+      "url": "https://github.com/sponsors/southleft"
     }
   ],
   "navigation": [

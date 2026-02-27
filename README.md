@@ -673,6 +673,14 @@ The architecture supports adding new apps with minimal boilerplate — each app 
 
 ---
 
+## 💛 Support This Project
+
+Figma Console MCP is free and open source. If it's saved your team time or improved your design-to-code workflow, consider sponsoring its continued development.
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-southleft-ea4aaa?logo=github-sponsors&logoColor=white)](https://github.com/sponsors/southleft)
+
+---
+
 ## 💻 Development
 
 ```bash

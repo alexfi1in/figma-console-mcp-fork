@@ -7,7 +7,7 @@
  * fetch mocking.
  */
 
-import { registerVersionTools } from "../src/core/version-tools";
+import { registerVersionTools, _clearVersionSnapshotCacheForTesting } from "../src/core/version-tools";
 
 // ============================================================================
 // Mock infrastructure
@@ -44,6 +44,10 @@ function createMockFigmaAPI(overrides: Record<string, jest.Mock> = {}) {
 		...overrides,
 	};
 }
+
+beforeEach(() => {
+	_clearVersionSnapshotCacheForTesting();
+});
 
 const MOCK_FILE_URL = "https://www.figma.com/design/abc123/My-File";
 const MOCK_FILE_KEY = "abc123";
@@ -87,11 +91,13 @@ describe("Version Tools", () => {
 		);
 	});
 
-	it("registers both version tools", () => {
-		expect(server.tool).toHaveBeenCalledTimes(2);
+	it("registers all four version tools", () => {
+		expect(server.tool).toHaveBeenCalledTimes(4);
 		const names = server.tool.mock.calls.map((c: any[]) => c[0]);
 		expect(names).toContain("figma_get_file_versions");
 		expect(names).toContain("figma_get_file_at_version");
+		expect(names).toContain("figma_diff_versions");
+		expect(names).toContain("figma_get_changes_since_version");
 	});
 
 	// -----------------------------------------------------------------------
@@ -443,6 +449,209 @@ describe("Version Tools", () => {
 			expect(result.isError).toBe(true);
 			const data = JSON.parse(result.content[0].text);
 			expect(data.error).toBe("invalid_url");
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// figma_diff_versions
+	// -----------------------------------------------------------------------
+	describe("figma_diff_versions", () => {
+		const makeFileResp = (pages: Array<{ id: string; name: string }>) => ({
+			document: {
+				id: "0:0",
+				name: "Document",
+				type: "DOCUMENT",
+				children: pages.map((p) => ({ id: p.id, name: p.name, type: "CANVAS" })),
+			},
+			version: "VFOO",
+			lastModified: "2026-04-01T00:00:00Z",
+			thumbnailUrl: "https://example.com/thumb.png",
+		});
+
+		it("returns page-structure diff and a hint when no component_ids provided", async () => {
+			mockApi.getFile
+				.mockResolvedValueOnce(makeFileResp([{ id: "1:0", name: "Page A" }]))
+				.mockResolvedValueOnce(
+					makeFileResp([
+						{ id: "1:0", name: "Page A" },
+						{ id: "2:0", name: "Page B" },
+					]),
+				);
+
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.page_structure.summary.added).toBe(1);
+			expect(data.scoped_nodes).toBeUndefined();
+			expect(data.summary.api_calls_made).toBe(2);
+			expect(data.notes.some((n: string) => n.includes("Pass component_ids"))).toBe(true);
+			expect(data.notes.some((n: string) => n.includes("Variable VALUE history"))).toBe(true);
+			expect(mockApi.getFile).toHaveBeenCalledWith(MOCK_FILE_KEY, { version: "vA", depth: 1 });
+			expect(mockApi.getFile).toHaveBeenCalledWith(MOCK_FILE_KEY, { version: "vB", depth: 1 });
+		});
+
+		it("uses HEAD (no version param) when to_version is 'current'", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
+
+			const tool = server._getTool("figma_diff_versions");
+			await tool.handler({ from_version: "vA", to_version: "current" });
+
+			expect(mockApi.getFile).toHaveBeenCalledWith(MOCK_FILE_KEY, { version: "vA", depth: 1 });
+			expect(mockApi.getFile).toHaveBeenCalledWith(MOCK_FILE_KEY, { depth: 1 });
+		});
+
+		it("returns scoped node diffs when component_ids provided", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
+			mockApi.getNodes
+				.mockResolvedValueOnce({
+					nodes: {
+						"100:1": {
+							document: {
+								id: "100:1",
+								name: "Button",
+								type: "COMPONENT_SET",
+								description: "old",
+								componentPropertyDefinitions: {
+									"Text#1:1": { type: "TEXT", defaultValue: "Label" },
+								},
+								children: [],
+								boundVariables: {},
+							},
+						},
+					},
+				})
+				.mockResolvedValueOnce({
+					nodes: {
+						"100:1": {
+							document: {
+								id: "100:1",
+								name: "Button v2",
+								type: "COMPONENT_SET",
+								description: "new",
+								componentPropertyDefinitions: {
+									"Text#1:1": { type: "TEXT", defaultValue: "Label" },
+									"Disabled#1:2": { type: "BOOLEAN", defaultValue: false },
+								},
+								children: [],
+								boundVariables: {},
+							},
+						},
+					},
+				});
+
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({
+				from_version: "vA",
+				to_version: "vB",
+				component_ids: ["100:1"],
+				mode: "detailed",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.scoped_nodes).toHaveLength(1);
+			expect(data.scoped_nodes[0].name_changed).toEqual({ from: "Button", to: "Button v2" });
+			expect(data.scoped_nodes[0].description_changed.to).toBe("new");
+			expect(data.scoped_nodes[0].component_properties.summary.added).toBe(1);
+			expect(data.summary.scoped_nodes_with_changes).toBe(1);
+			expect(data.summary.api_calls_made).toBe(4); // 2 doc + 2 node
+		});
+
+		it("rejects identical from/to versions", async () => {
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vA" });
+
+			expect(result.isError).toBe(true);
+			const data = JSON.parse(result.content[0].text);
+			expect(data.error).toBe("same_version");
+		});
+
+		it("captures fetch errors per node without aborting the whole diff", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([]));
+			mockApi.getNodes
+				.mockResolvedValueOnce({ nodes: { "1:1": { document: { id: "1:1", name: "ok", type: "FRAME" } } } })
+				.mockResolvedValueOnce({ nodes: { "1:1": { document: { id: "1:1", name: "ok", type: "FRAME" } } } })
+				.mockRejectedValueOnce(new Error("Figma API error (404): not found"))
+				.mockRejectedValueOnce(new Error("Figma API error (404): not found"));
+
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({
+				from_version: "vA",
+				to_version: "vB",
+				component_ids: ["1:1", "9:9"],
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.scoped_nodes).toHaveLength(1);
+			expect(data._fetch_errors).toHaveLength(1);
+			expect(data._fetch_errors[0].node_id).toBe("9:9");
+		});
+
+		it("attaches scope hint on 403", async () => {
+			mockApi.getFile.mockRejectedValue(new Error("Figma API error (403): forbidden"));
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+			expect(result.isError).toBe(true);
+			const data = JSON.parse(result.content[0].text);
+			expect(data.message).toContain("file_versions:read");
+		});
+
+		it("returns no_file_url when neither URL is available", async () => {
+			server = createMockServer();
+			registerVersionTools(server as any, async () => mockApi as any, () => null);
+			const tool = server._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+			expect(result.isError).toBe(true);
+			expect(JSON.parse(result.content[0].text).error).toBe("no_file_url");
+		});
+
+		it("uses cache for repeat fetches at same version_id", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
+			const tool = server._getTool("figma_diff_versions");
+			await tool.handler({ from_version: "vA", to_version: "vB" });
+			const firstCallCount = mockApi.getFile.mock.calls.length;
+			// Second diff with same versions should hit cache for both fetches.
+			await tool.handler({ from_version: "vA", to_version: "vB" });
+			const secondCallCount = mockApi.getFile.mock.calls.length;
+			expect(secondCallCount).toBe(firstCallCount); // no new live fetches
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// figma_get_changes_since_version
+	// -----------------------------------------------------------------------
+	describe("figma_get_changes_since_version", () => {
+		const makeFileResp = (pages: Array<{ id: string; name: string }>) => ({
+			document: {
+				id: "0:0",
+				name: "Document",
+				type: "DOCUMENT",
+				children: pages.map((p) => ({ id: p.id, name: p.name, type: "CANVAS" })),
+			},
+			version: "VHEAD",
+			lastModified: "2026-05-01T00:00:00Z",
+		});
+
+		it("delegates to runDiff with to_version='current'", async () => {
+			mockApi.getFile
+				.mockResolvedValueOnce(makeFileResp([{ id: "1:0", name: "Old" }]))
+				.mockResolvedValueOnce(makeFileResp([{ id: "1:0", name: "Old" }, { id: "2:0", name: "New" }]));
+
+			const tool = server._getTool("figma_get_changes_since_version");
+			const result = await tool.handler({ since_version: "vOld" });
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.from.version_id).toBe("vOld");
+			expect(data.to.version_id).toBe("current");
+			expect(data.page_structure.summary.added).toBe(1);
+			// First call: from version_id; second: HEAD without version param.
+			expect(mockApi.getFile).toHaveBeenNthCalledWith(1, MOCK_FILE_KEY, {
+				version: "vOld",
+				depth: 1,
+			});
+			expect(mockApi.getFile).toHaveBeenNthCalledWith(2, MOCK_FILE_KEY, { depth: 1 });
 		});
 	});
 });

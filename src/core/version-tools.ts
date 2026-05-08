@@ -1,18 +1,22 @@
 /**
  * Figma Version History MCP Tools
  *
- * Phase 1 of the version-history-diff effort:
  *   - figma_get_file_versions: list a file's version history with
  *     auto-pagination, labeled-only filtering by default, and a hard cap.
  *   - figma_get_file_at_version: snapshot a file (or selected nodes) at a
  *     specific version_id. Thin wrapper over getFile/getNodes which already
  *     accept the `version` query param.
+ *   - figma_diff_versions: compare two versions. Always returns a page-structure
+ *     diff (cheap, 2 API calls). When component_ids are passed, also returns
+ *     per-node diffs at depth=2 (added/removed children, name/description
+ *     changes, componentPropertyDefinitions changes, boundVariables deltas).
+ *   - figma_get_changes_since_version: convenience wrapper for diff against HEAD.
  *
- * Both work in local and Cloudflare Workers modes. Required scope is
- * file_versions:read on OAuth, or "Versions" Read on a Personal Access Token.
+ * All tools work in local and Cloudflare Workers modes. Required scope is
+ * file_versions:read on OAuth, or "Versions" Read on a Personal Access Token,
+ * plus the standard file_content:read for fetching file snapshots.
  *
- * The diff engine (figma_diff_versions, figma_get_changes_since_version)
- * arrives in Phase 2; design brief at .notes/VERSION-HISTORY-DIFF-DESIGN.md.
+ * Design notes at .notes/VERSION-HISTORY-DIFF-DESIGN.md.
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -20,8 +24,71 @@ import { z } from "zod";
 import type { FigmaAPI } from "./figma-api.js";
 import { extractFileKey } from "./figma-api.js";
 import { createChildLogger } from "./logger.js";
+import { VersionSnapshotCache } from "./diff/version-cache.js";
+import {
+	diffNode,
+	diffPageStructure,
+	type DiffMode,
+	type NodeDiff,
+	type PageStructureDiff,
+} from "./diff/diff-engine.js";
 
 const logger = createChildLogger({ component: "version-tools" });
+
+// Module-scoped cache shared across all tool calls within a process.
+// Past versions are immutable so the cache can live indefinitely.
+const versionSnapshotCache = new VersionSnapshotCache({ maxEntries: 50 });
+
+/** Test-only: clears the module-scoped snapshot cache so unit tests see fresh state. */
+export function _clearVersionSnapshotCacheForTesting(): void {
+	versionSnapshotCache.clear();
+}
+
+// Sentinel for "use HEAD instead of a specific version_id"
+const CURRENT_VERSION_SENTINEL = "current";
+
+function isCurrentSentinel(versionId: string): boolean {
+	return versionId === CURRENT_VERSION_SENTINEL;
+}
+
+/**
+ * Fetch the document at depth=1 for either a specific version_id or HEAD.
+ * HEAD responses are not cached (they're mutable). Past versions are cached.
+ */
+async function fetchDocumentAtVersion(
+	api: FigmaAPI,
+	fileKey: string,
+	versionId: string,
+): Promise<any> {
+	const isHead = isCurrentSentinel(versionId);
+	const cacheKey = isHead ? null : versionSnapshotCache.makeKey(fileKey, versionId, 1);
+	const cached = versionSnapshotCache.get<any>(cacheKey);
+	if (cached) return cached;
+	const opts = isHead ? { depth: 1 } : { version: versionId, depth: 1 };
+	const data = await api.getFile(fileKey, opts);
+	if (cacheKey) versionSnapshotCache.set(cacheKey, data);
+	return data;
+}
+
+/**
+ * Fetch a single node at depth=2 for either a specific version_id or HEAD.
+ * Same caching policy as above.
+ */
+async function fetchNodeAtVersion(
+	api: FigmaAPI,
+	fileKey: string,
+	nodeId: string,
+	versionId: string,
+): Promise<any> {
+	const isHead = isCurrentSentinel(versionId);
+	const cacheKey = isHead ? null : versionSnapshotCache.makeKey(fileKey, versionId, 2, [nodeId]);
+	const cached = versionSnapshotCache.get<any>(cacheKey);
+	if (cached) return cached;
+	const opts = isHead ? { depth: 2 } : { version: versionId, depth: 2 };
+	const data = await api.getNodes(fileKey, [nodeId], opts);
+	if (cacheKey) versionSnapshotCache.set(cacheKey, data);
+	return data;
+}
 
 // ============================================================================
 // Internal types
@@ -354,4 +421,223 @@ export function registerVersionTools(
 			}
 		},
 	);
+
+	// Shared diff implementation invoked by both figma_diff_versions and
+	// figma_get_changes_since_version. Keeping it here (rather than at module
+	// scope) so it closes over getFigmaAPI/getCurrentUrl without re-passing.
+	const runDiff = async (args: {
+		fileUrl?: string;
+		from_version: string;
+		to_version: string;
+		component_ids?: string[];
+		mode?: DiffMode;
+	}) => {
+		const { fileUrl, from_version, to_version, component_ids } = args;
+		const mode: DiffMode = args.mode ?? "standard";
+		try {
+			const url = fileUrl || getCurrentUrl();
+			if (!url) {
+				return errorResponse(
+					"no_file_url",
+					"No Figma file URL available. Pass the fileUrl parameter or ensure the Desktop Bridge plugin is open in Figma.",
+				);
+			}
+			const fileKey = extractFileKey(url);
+			if (!fileKey) {
+				return errorResponse("invalid_url", `Invalid Figma URL: ${url}`);
+			}
+			if (from_version === to_version) {
+				return errorResponse(
+					"same_version",
+					"from_version and to_version are identical — nothing to diff.",
+				);
+			}
+
+			logger.info(
+				{ fileKey, from_version, to_version, mode, scoped: !!component_ids?.length },
+				"Diffing versions",
+			);
+			const api = await getFigmaAPI();
+
+			// Phase A: cheap orientation, parallel fetch
+			const [fromFile, toFile] = await Promise.all([
+				fetchDocumentAtVersion(api, fileKey, from_version),
+				fetchDocumentAtVersion(api, fileKey, to_version),
+			]);
+			let apiCalls = 2;
+			const pageDiff: PageStructureDiff = diffPageStructure(
+				fromFile.document,
+				toFile.document,
+			);
+
+			// Phase B: scoped node diffs (only if user provided component_ids)
+			const scoped: NodeDiff[] = [];
+			const fetchErrors: Array<{ node_id: string; error: string }> = [];
+			if (component_ids && component_ids.length > 0) {
+				for (const nodeId of component_ids) {
+					try {
+						const [fromResp, toResp] = await Promise.all([
+							fetchNodeAtVersion(api, fileKey, nodeId, from_version),
+							fetchNodeAtVersion(api, fileKey, nodeId, to_version),
+						]);
+						apiCalls += 2;
+						const fromNode = fromResp?.nodes?.[nodeId]?.document ?? null;
+						const toNode = toResp?.nodes?.[nodeId]?.document ?? null;
+						scoped.push(diffNode(fromNode, toNode, mode));
+					} catch (e) {
+						fetchErrors.push({
+							node_id: nodeId,
+							error: e instanceof Error ? e.message : String(e),
+						});
+					}
+				}
+			}
+
+			const fromMeta = extractFileMeta(fromFile, from_version);
+			const toMeta = extractFileMeta(toFile, to_version);
+
+			const notes: string[] = [];
+			if (!component_ids || component_ids.length === 0) {
+				notes.push(
+					"Only page-structure diff returned. Pass component_ids to get per-component analysis (added/removed children, property changes, binding changes).",
+				);
+			}
+			notes.push(
+				"Variable VALUE history is not retrievable from Figma REST API. Variable definition value changes between these versions are not represented; only binding-reference changes on scoped nodes are detected.",
+			);
+			if (fetchErrors.length > 0) {
+				notes.push(
+					`Failed to fetch ${fetchErrors.length} of ${component_ids?.length ?? 0} requested nodes — see _fetch_errors.`,
+				);
+			}
+
+			const scopedChanged = scoped.filter((n) => n.change_count > 0).length;
+
+			const result = {
+				file_key: fileKey,
+				from: fromMeta,
+				to: toMeta,
+				page_structure: pageDiff,
+				scoped_nodes: component_ids && component_ids.length > 0 ? scoped : undefined,
+				summary: {
+					page_changes:
+						pageDiff.summary.added + pageDiff.summary.removed + pageDiff.summary.renamed,
+					scoped_nodes_requested: component_ids?.length ?? 0,
+					scoped_nodes_returned: scoped.length,
+					scoped_nodes_with_changes: scopedChanged,
+					api_calls_made: apiCalls,
+				},
+				notes,
+				_fetch_errors: fetchErrors.length > 0 ? fetchErrors : undefined,
+			};
+
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: JSON.stringify(result),
+					},
+				],
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logger.error({ error }, "Failed to diff versions");
+			const hint = message.includes("403")
+				? " Hint: ensure your token has both file_content:read and file_versions:read scopes."
+				: message.includes("404")
+					? " Hint: a version_id may have been pruned or may not belong to this file. Use figma_get_file_versions to list valid IDs."
+					: "";
+			return errorResponse("diff_versions_failed", message + hint);
+		}
+	};
+
+	// -----------------------------------------------------------------------
+	// Tool: figma_diff_versions
+	// -----------------------------------------------------------------------
+	server.tool(
+		"figma_diff_versions",
+		"Diff two versions of a Figma file. Always returns a cheap page-structure diff (added/removed/renamed pages, 2 API calls). Pass component_ids to additionally get per-node deep diffs at depth=2 (added/removed children, name/description changes, componentPropertyDefinitions changes for COMPONENT_SETs, boundVariables deltas) — costs 2 API calls per scoped node. Use 'current' for to_version to diff against HEAD. NOTE: variable VALUE history is not retrievable from Figma REST and is not represented in this diff.",
+		{
+			fileUrl: z
+				.string()
+				.url()
+				.optional()
+				.describe("Figma file URL. Uses current URL if omitted."),
+			from_version: z
+				.string()
+				.describe("The earlier version_id to compare from. Get from figma_get_file_versions."),
+			to_version: z
+				.string()
+				.describe("The later version_id to compare to. Use 'current' for HEAD."),
+			component_ids: z
+				.array(z.string())
+				.optional()
+				.describe("Optional. Node IDs (typically COMPONENT_SETs) to diff in detail. Without this you only get the page-structure diff. Use figma_get_design_system_kit or figma_search_components to discover IDs."),
+			mode: z
+				.enum(["summary", "standard", "detailed"])
+				.optional()
+				.default("standard")
+				.describe("Output verbosity. summary=counts only, standard=names+counts (default), detailed=full property/binding details."),
+		},
+		async (args) => runDiff(args as any),
+	);
+
+	// -----------------------------------------------------------------------
+	// Tool: figma_get_changes_since_version
+	// -----------------------------------------------------------------------
+	server.tool(
+		"figma_get_changes_since_version",
+		"Convenience wrapper for figma_diff_versions: compares a given version against the current HEAD. Same output shape as figma_diff_versions, with to_version implicitly 'current'. Useful for 'what's changed since the last code-sync' workflows.",
+		{
+			fileUrl: z
+				.string()
+				.url()
+				.optional()
+				.describe("Figma file URL. Uses current URL if omitted."),
+			since_version: z
+				.string()
+				.describe("The version_id to compare against the current HEAD."),
+			component_ids: z
+				.array(z.string())
+				.optional()
+				.describe("Optional. Node IDs to diff in detail. Same semantics as figma_diff_versions."),
+			mode: z
+				.enum(["summary", "standard", "detailed"])
+				.optional()
+				.default("standard"),
+		},
+		async ({ fileUrl, since_version, component_ids, mode }) =>
+			runDiff({
+				fileUrl,
+				from_version: since_version,
+				to_version: CURRENT_VERSION_SENTINEL,
+				component_ids,
+				mode: mode as DiffMode | undefined,
+			}),
+	);
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function errorResponse(code: string, message: string) {
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: JSON.stringify({ error: code, message }),
+			},
+		],
+		isError: true,
+	};
+}
+
+function extractFileMeta(fileData: any, requestedVersionId: string) {
+	return {
+		version_id: requestedVersionId,
+		resolved_version_id: fileData?.version ?? null,
+		last_modified: fileData?.lastModified ?? null,
+		thumbnail_url: fileData?.thumbnailUrl ?? null,
+	};
 }

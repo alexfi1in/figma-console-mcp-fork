@@ -22,6 +22,7 @@ import { FigmaAPI, extractFileKey, formatVariables, formatComponentData } from "
 import { registerFigmaAPITools } from "./core/figma-tools.js";
 import { registerDesignCodeTools } from "./core/design-code-tools.js";
 import { registerCommentTools } from "./core/comment-tools.js";
+import { registerVersionTools } from "./core/version-tools.js";
 import { registerAnnotationTools } from "./core/annotation-tools.js";
 import { registerDeepComponentTools } from "./core/deep-component-tools.js";
 import { registerDesignSystemTools } from "./core/design-system-tools.js";
@@ -1029,6 +1030,14 @@ export class FigmaConsoleMCPv3 extends McpAgent {
 			{ isRemoteMode: true },
 		);
 
+		// Register Version History tools
+		registerVersionTools(
+			this.server,
+			async () => await this.getFigmaAPI(),
+			() => this.browserManager?.getCurrentUrl() || null,
+			{ isRemoteMode: true },
+		);
+
 		// Register Design System Kit tool
 		registerDesignSystemTools(
 			this.server,
@@ -1456,6 +1465,12 @@ export default {
 			);
 
 			registerCommentTools(
+				statelessServer,
+				async () => statelessApi,
+				getCloudFileUrl,
+			);
+
+			registerVersionTools(
 				statelessServer,
 				async () => statelessApi,
 				getCloudFileUrl,

@@ -141,9 +141,13 @@ export function registerVersionTools(
 				let apiCalls = 0;
 
 				while (pages < MAX_SCAN_PAGES && figmaSaysMore && collected.length < cap) {
+					// Figma's pagination semantics: in a newest-first list, `after=X`
+					// returns versions that come AFTER X in list order, i.e. OLDER in time.
+					// (Empirically verified — `before=X` returns newer items, which is the
+					// opposite of what we want when paging into history.)
 					const response = await api.getFileVersions(fileKey, {
 						page_size: FIGMA_PAGE_SIZE_MAX,
-						before: cursorForNextPage,
+						after: cursorForNextPage,
 					});
 					pages++;
 					apiCalls++;
@@ -180,8 +184,17 @@ export function registerVersionTools(
 					cursorForNextPage = lastReceivedId;
 				}
 
+				// next_cursor must be the LAST DISPLAYED item, not the last RECEIVED.
+				// If the user paged forward with the last-received id, they would skip the
+				// items between their last visible row and the page boundary.
+				// Edge case: if labeled-only mode collected zero items but Figma has more
+				// data to scan, expose lastReceivedId so the caller can keep scanning past
+				// the autosave-only stretch.
+				const lastCollectedId = collected.length > 0 ? collected[collected.length - 1].id : null;
 				const hasMore = collected.length >= cap || figmaSaysMore;
-				const nextCursor = hasMore && lastReceivedId ? lastReceivedId : null;
+				const nextCursor = hasMore
+					? (lastCollectedId ?? lastReceivedId)
+					: null;
 
 				const result = {
 					file_key: fileKey,

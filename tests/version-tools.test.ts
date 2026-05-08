@@ -146,20 +146,21 @@ describe("Version Tools", () => {
 			// Page 1 returns 2 labeled versions and signals more available.
 			// Page 2 returns 2 more labeled versions and signals more available.
 			// max_versions=3 means we should stop mid-page-2 and report has_more=true.
+			// next_cursor must be the last DISPLAYED item (v3), not the last RECEIVED (v4).
 			mockApi.getFileVersions
 				.mockResolvedValueOnce({
 					versions: [
 						makeVersion({ id: "v1", label: "L1" }),
 						makeVersion({ id: "v2", label: "L2" }),
 					],
-					pagination: { prev_page: null, next_page: "https://api.figma.com/...?before=v2" },
+					pagination: { prev_page: null, next_page: "https://api.figma.com/...?after=v2" },
 				})
 				.mockResolvedValueOnce({
 					versions: [
 						makeVersion({ id: "v3", label: "L3" }),
 						makeVersion({ id: "v4", label: "L4" }),
 					],
-					pagination: { prev_page: null, next_page: "https://api.figma.com/...?before=v4" },
+					pagination: { prev_page: null, next_page: "https://api.figma.com/...?after=v4" },
 				});
 
 			const tool = server._getTool("figma_get_file_versions");
@@ -168,15 +169,40 @@ describe("Version Tools", () => {
 			const data = JSON.parse(result.content[0].text);
 			expect(data.versions.map((v: any) => v.id)).toEqual(["v1", "v2", "v3"]);
 			expect(data.pagination.has_more).toBe(true);
-			expect(data.pagination.next_cursor).toBe("v4"); // last received id, used as 'before' on next call
+			expect(data.pagination.next_cursor).toBe("v3"); // last DISPLAYED — caller continues with after=v3
 			expect(data._meta.api_calls_made).toBe(2);
+		});
+
+		it("falls back to last-received id as next_cursor when no items collected", async () => {
+			// Labeled-only mode, page returns only autosaves but Figma signals more pages.
+			// Caller needs *some* cursor to continue scanning forward.
+			mockApi.getFileVersions.mockResolvedValueOnce({
+				versions: [
+					makeVersion({ id: "vA", label: "" }),
+					makeVersion({ id: "vB", label: "" }),
+				],
+				pagination: { prev_page: null, next_page: "https://api.figma.com/...?after=vB" },
+			}).mockResolvedValueOnce({
+				versions: [],
+				pagination: { prev_page: null, next_page: null },
+			});
+
+			const tool = server._getTool("figma_get_file_versions");
+			const result = await tool.handler({ include_autosaves: false, max_versions: 50 });
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.versions).toHaveLength(0);
+			expect(data.pagination.filtered_out_autosaves).toBe(2);
+			// Loop exited because page 2 returned empty (figmaSaysMore=false).
+			expect(data.pagination.has_more).toBe(false);
+			expect(data.pagination.next_cursor).toBeNull();
 		});
 
 		it("stops paginating when Figma signals no more pages", async () => {
 			mockApi.getFileVersions
 				.mockResolvedValueOnce({
 					versions: [makeVersion({ id: "v1", label: "L1" })],
-					pagination: { prev_page: null, next_page: "https://api.figma.com/...?before=v1" },
+					pagination: { prev_page: null, next_page: "https://api.figma.com/...?after=v1" },
 				})
 				.mockResolvedValueOnce({
 					versions: [makeVersion({ id: "v2", label: "L2" })],
@@ -193,7 +219,7 @@ describe("Version Tools", () => {
 			expect(data._meta.api_calls_made).toBe(2);
 		});
 
-		it("passes provided cursor as 'before' on the first call", async () => {
+		it("passes provided cursor as 'after' on the first call", async () => {
 			mockApi.getFileVersions.mockResolvedValue({
 				versions: [makeVersion({ id: "vOld", label: "Old" })],
 				pagination: { prev_page: null, next_page: null },
@@ -204,7 +230,7 @@ describe("Version Tools", () => {
 
 			expect(mockApi.getFileVersions).toHaveBeenCalledWith(MOCK_FILE_KEY, {
 				page_size: 50,
-				before: "vSomething",
+				after: "vSomething",
 			});
 		});
 

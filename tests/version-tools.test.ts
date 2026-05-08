@@ -486,6 +486,7 @@ describe("Version Tools", () => {
 			expect(data.page_structure.summary.added).toBe(1);
 			expect(data.scoped_nodes).toBeUndefined();
 			expect(data.summary.api_calls_made).toBe(2);
+			expect(data.summary.cache_hits).toBe(0);
 			expect(data.notes.some((n: string) => n.includes("Pass component_ids"))).toBe(true);
 			expect(data.notes.some((n: string) => n.includes("Variable VALUE history"))).toBe(true);
 			expect(mockApi.getFile).toHaveBeenCalledWith(MOCK_FILE_KEY, { version: "vA", depth: 1 });
@@ -609,12 +610,18 @@ describe("Version Tools", () => {
 		it("uses cache for repeat fetches at same version_id", async () => {
 			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
 			const tool = server._getTool("figma_diff_versions");
-			await tool.handler({ from_version: "vA", to_version: "vB" });
+			const first = await tool.handler({ from_version: "vA", to_version: "vB" });
+			const firstData = JSON.parse(first.content[0].text);
+			expect(firstData.summary.api_calls_made).toBe(2);
+			expect(firstData.summary.cache_hits).toBe(0);
+
 			const firstCallCount = mockApi.getFile.mock.calls.length;
-			// Second diff with same versions should hit cache for both fetches.
-			await tool.handler({ from_version: "vA", to_version: "vB" });
-			const secondCallCount = mockApi.getFile.mock.calls.length;
-			expect(secondCallCount).toBe(firstCallCount); // no new live fetches
+			// Second diff with same versions: both fetches hit cache.
+			const second = await tool.handler({ from_version: "vA", to_version: "vB" });
+			const secondData = JSON.parse(second.content[0].text);
+			expect(mockApi.getFile.mock.calls.length).toBe(firstCallCount); // no new live fetches
+			expect(secondData.summary.api_calls_made).toBe(0);
+			expect(secondData.summary.cache_hits).toBe(2);
 		});
 	});
 

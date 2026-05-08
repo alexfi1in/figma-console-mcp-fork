@@ -51,43 +51,49 @@ function isCurrentSentinel(versionId: string): boolean {
 	return versionId === CURRENT_VERSION_SENTINEL;
 }
 
+interface FetchResult<T> {
+	data: T;
+	cached: boolean;
+}
+
 /**
  * Fetch the document at depth=1 for either a specific version_id or HEAD.
  * HEAD responses are not cached (they're mutable). Past versions are cached.
+ * Returns { data, cached } so callers can report accurate live-call counts.
  */
 async function fetchDocumentAtVersion(
 	api: FigmaAPI,
 	fileKey: string,
 	versionId: string,
-): Promise<any> {
+): Promise<FetchResult<any>> {
 	const isHead = isCurrentSentinel(versionId);
 	const cacheKey = isHead ? null : versionSnapshotCache.makeKey(fileKey, versionId, 1);
 	const cached = versionSnapshotCache.get<any>(cacheKey);
-	if (cached) return cached;
+	if (cached) return { data: cached, cached: true };
 	const opts = isHead ? { depth: 1 } : { version: versionId, depth: 1 };
 	const data = await api.getFile(fileKey, opts);
 	if (cacheKey) versionSnapshotCache.set(cacheKey, data);
-	return data;
+	return { data, cached: false };
 }
 
 /**
  * Fetch a single node at depth=2 for either a specific version_id or HEAD.
- * Same caching policy as above.
+ * Same caching policy and return contract as above.
  */
 async function fetchNodeAtVersion(
 	api: FigmaAPI,
 	fileKey: string,
 	nodeId: string,
 	versionId: string,
-): Promise<any> {
+): Promise<FetchResult<any>> {
 	const isHead = isCurrentSentinel(versionId);
 	const cacheKey = isHead ? null : versionSnapshotCache.makeKey(fileKey, versionId, 2, [nodeId]);
 	const cached = versionSnapshotCache.get<any>(cacheKey);
-	if (cached) return cached;
+	if (cached) return { data: cached, cached: true };
 	const opts = isHead ? { depth: 2 } : { version: versionId, depth: 2 };
 	const data = await api.getNodes(fileKey, [nodeId], opts);
 	if (cacheKey) versionSnapshotCache.set(cacheKey, data);
-	return data;
+	return { data, cached: false };
 }
 
 // ============================================================================
@@ -460,14 +466,19 @@ export function registerVersionTools(
 			const api = await getFigmaAPI();
 
 			// Phase A: cheap orientation, parallel fetch
+			let apiCalls = 0;
+			let cacheHits = 0;
 			const [fromFile, toFile] = await Promise.all([
 				fetchDocumentAtVersion(api, fileKey, from_version),
 				fetchDocumentAtVersion(api, fileKey, to_version),
 			]);
-			let apiCalls = 2;
+			for (const r of [fromFile, toFile]) {
+				if (r.cached) cacheHits++;
+				else apiCalls++;
+			}
 			const pageDiff: PageStructureDiff = diffPageStructure(
-				fromFile.document,
-				toFile.document,
+				fromFile.data.document,
+				toFile.data.document,
 			);
 
 			// Phase B: scoped node diffs (only if user provided component_ids)
@@ -480,9 +491,12 @@ export function registerVersionTools(
 							fetchNodeAtVersion(api, fileKey, nodeId, from_version),
 							fetchNodeAtVersion(api, fileKey, nodeId, to_version),
 						]);
-						apiCalls += 2;
-						const fromNode = fromResp?.nodes?.[nodeId]?.document ?? null;
-						const toNode = toResp?.nodes?.[nodeId]?.document ?? null;
+						for (const r of [fromResp, toResp]) {
+							if (r.cached) cacheHits++;
+							else apiCalls++;
+						}
+						const fromNode = fromResp.data?.nodes?.[nodeId]?.document ?? null;
+						const toNode = toResp.data?.nodes?.[nodeId]?.document ?? null;
 						scoped.push(diffNode(fromNode, toNode, mode));
 					} catch (e) {
 						fetchErrors.push({
@@ -493,8 +507,8 @@ export function registerVersionTools(
 				}
 			}
 
-			const fromMeta = extractFileMeta(fromFile, from_version);
-			const toMeta = extractFileMeta(toFile, to_version);
+			const fromMeta = extractFileMeta(fromFile.data, from_version);
+			const toMeta = extractFileMeta(toFile.data, to_version);
 
 			const notes: string[] = [];
 			if (!component_ids || component_ids.length === 0) {
@@ -526,6 +540,7 @@ export function registerVersionTools(
 					scoped_nodes_returned: scoped.length,
 					scoped_nodes_with_changes: scopedChanged,
 					api_calls_made: apiCalls,
+					cache_hits: cacheHits,
 				},
 				notes,
 				_fetch_errors: fetchErrors.length > 0 ? fetchErrors : undefined,

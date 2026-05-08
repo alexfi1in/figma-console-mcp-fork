@@ -91,13 +91,14 @@ describe("Version Tools", () => {
 		);
 	});
 
-	it("registers all four version tools", () => {
-		expect(server.tool).toHaveBeenCalledTimes(4);
+	it("registers all five version tools", () => {
+		expect(server.tool).toHaveBeenCalledTimes(5);
 		const names = server.tool.mock.calls.map((c: any[]) => c[0]);
 		expect(names).toContain("figma_get_file_versions");
 		expect(names).toContain("figma_get_file_at_version");
 		expect(names).toContain("figma_diff_versions");
 		expect(names).toContain("figma_get_changes_since_version");
+		expect(names).toContain("figma_generate_changelog");
 	});
 
 	// -----------------------------------------------------------------------
@@ -659,6 +660,174 @@ describe("Version Tools", () => {
 				depth: 1,
 			});
 			expect(mockApi.getFile).toHaveBeenNthCalledWith(2, MOCK_FILE_KEY, { depth: 1 });
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// figma_generate_changelog
+	// -----------------------------------------------------------------------
+	describe("figma_generate_changelog", () => {
+		const makeFileResp = (
+			pages: Array<{ id: string; name: string }>,
+			overrides: Partial<{ name: string; version: string; lastModified: string }> = {},
+		) => ({
+			document: {
+				id: "0:0",
+				name: "Document",
+				type: "DOCUMENT",
+				children: pages.map((p) => ({ id: p.id, name: p.name, type: "CANVAS" })),
+			},
+			name: overrides.name ?? "Test Design System",
+			version: overrides.version ?? "VRESOLVED",
+			lastModified: overrides.lastModified ?? "2026-04-01T00:00:00Z",
+		});
+
+		const versionsListWithUsers = (versions: Array<{ id: string; label: string; user: string; created_at: string }>) => ({
+			versions: versions.map((v) => ({
+				id: v.id,
+				label: v.label,
+				description: "",
+				created_at: v.created_at,
+				user: { id: `u-${v.user}`, handle: v.user, img_url: "" },
+			})),
+			pagination: { prev_page: null, next_page: null },
+		});
+
+		it("returns markdown + structured payload with enriched authors", async () => {
+			mockApi.getFile
+				.mockResolvedValueOnce(makeFileResp([{ id: "1:0", name: "Page A" }]))
+				.mockResolvedValueOnce(
+					makeFileResp([{ id: "1:0", name: "Page A" }, { id: "2:0", name: "Page B" }]),
+				);
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				versionsListWithUsers([
+					{ id: "vTo", label: "v2 published", user: "bob", created_at: "2026-04-01T00:00:00Z" },
+					{ id: "vFrom", label: "v1 published", user: "alice", created_at: "2026-01-01T00:00:00Z" },
+				]),
+			);
+
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({ from_version: "vFrom", to_version: "vTo" });
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.markdown).toContain("# Test Design System — Change Log");
+			expect(data.markdown).toContain("v1 published");
+			expect(data.markdown).toContain("v2 published");
+			expect(data.markdown).toContain("by alice");
+			expect(data.markdown).toContain("by bob");
+			expect(data.markdown).toContain("Page B");
+			expect(data.structured).toBeDefined();
+			expect(data.structured.page_structure.summary.added).toBe(1);
+			expect(data._meta.authors_enriched).toBe(true);
+			expect(data._meta.from_author_found).toBe(true);
+			expect(data._meta.to_author_found).toBe(true);
+		});
+
+		it("degrades gracefully when author lookup misses a version", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([]));
+			// Only "vTo" is in the lookback; "vFrom" is too old / unfound.
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				versionsListWithUsers([
+					{ id: "vTo", label: "Recent", user: "bob", created_at: "2026-04-01T00:00:00Z" },
+				]),
+			);
+
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({ from_version: "vFromAncient", to_version: "vTo" });
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data._meta.from_author_found).toBe(false);
+			expect(data._meta.to_author_found).toBe(true);
+			expect(data.markdown).toContain("metadata not available");
+			expect(data.markdown).toContain("by bob");
+		});
+
+		it("renders 'Current state' when to_version is 'current'", async () => {
+			mockApi.getFile
+				.mockResolvedValueOnce(makeFileResp([]))
+				.mockResolvedValueOnce(
+					makeFileResp([], {
+						lastModified: "2026-05-01T12:00:00Z",
+						version: "VHEADRESOLVED",
+					}),
+				);
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				versionsListWithUsers([
+					{ id: "vFrom", label: "v1", user: "alice", created_at: "2026-01-01T00:00:00Z" },
+				]),
+			);
+
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({ from_version: "vFrom", to_version: "current" });
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.markdown).toContain("Current state");
+			expect(data.markdown).toContain("2026-05-01");
+			expect(data._meta.to_author_found).toBe(false); // HEAD is not a labeled author
+			// Author lookup should have been called only for vFrom (not 'current')
+			expect(mockApi.getFileVersions).toHaveBeenCalledTimes(1);
+		});
+
+		it("propagates diff errors (e.g. same_version)", async () => {
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({ from_version: "vA", to_version: "vA" });
+
+			expect(result.isError).toBe(true);
+			const data = JSON.parse(result.content[0].text);
+			expect(data.error).toBe("same_version");
+		});
+
+		it("includes per-component sections in markdown when component_ids passed", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([]));
+			mockApi.getNodes.mockResolvedValue({
+				nodes: {
+					"100:1": {
+						document: {
+							id: "100:1",
+							name: "Button",
+							type: "COMPONENT_SET",
+							description: "",
+							componentPropertyDefinitions: {
+								"Text#1:1": { type: "TEXT", defaultValue: "Label" },
+							},
+							children: [],
+							boundVariables: {},
+						},
+					},
+				},
+			});
+			mockApi.getFileVersions.mockResolvedValue(
+				versionsListWithUsers([
+					{ id: "vTo", label: "v2", user: "bob", created_at: "2026-04-01T00:00:00Z" },
+					{ id: "vFrom", label: "v1", user: "alice", created_at: "2026-01-01T00:00:00Z" },
+				]),
+			);
+
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({
+				from_version: "vFrom",
+				to_version: "vTo",
+				component_ids: ["100:1"],
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			// Same node returned for both versions — no actual changes
+			expect(data.markdown).toContain("## Components");
+			expect(data.markdown).toMatch(/No changes:|0 change/);
+		});
+
+		it("survives author lookup throwing", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([]));
+			mockApi.getFileVersions.mockRejectedValueOnce(new Error("API down"));
+
+			const tool = server._getTool("figma_generate_changelog");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+
+			// Should still succeed — enrichment is best-effort
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.markdown).toContain("metadata not available");
 		});
 	});
 });

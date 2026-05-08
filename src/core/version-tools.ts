@@ -11,6 +11,8 @@
  *     per-node diffs at depth=2 (added/removed children, name/description
  *     changes, componentPropertyDefinitions changes, boundVariables deltas).
  *   - figma_get_changes_since_version: convenience wrapper for diff against HEAD.
+ *   - figma_generate_changelog: human-readable markdown changelog on top of
+ *     the diff, with author enrichment via figma_get_file_versions lookback.
  *
  * All tools work in local and Cloudflare Workers modes. Required scope is
  * file_versions:read on OAuth, or "Versions" Read on a Personal Access Token,
@@ -32,6 +34,10 @@ import {
 	type NodeDiff,
 	type PageStructureDiff,
 } from "./diff/diff-engine.js";
+import {
+	formatChangelogMarkdown,
+	type VersionAuthorMeta,
+} from "./diff/changelog-formatter.js";
 
 const logger = createChildLogger({ component: "version-tools" });
 
@@ -428,35 +434,48 @@ export function registerVersionTools(
 		},
 	);
 
-	// Shared diff implementation invoked by both figma_diff_versions and
-	// figma_get_changes_since_version. Keeping it here (rather than at module
-	// scope) so it closes over getFigmaAPI/getCurrentUrl without re-passing.
-	const runDiff = async (args: {
+	// Core diff computation. Returns the structured result so other tools
+	// (changelog, blame, etc.) can compose without re-parsing JSON. The thin
+	// MCP-wrapper handlers below format this for tool responses.
+	const computeDiff = async (args: {
 		fileUrl?: string;
 		from_version: string;
 		to_version: string;
 		component_ids?: string[];
 		mode?: DiffMode;
-	}) => {
+	}): Promise<
+		| {
+				ok: true;
+				data: any;
+				fileKey: string;
+				fileName: string;
+				fromFile: any;
+				toFile: any;
+		  }
+		| { ok: false; error: string; message: string }
+	> => {
 		const { fileUrl, from_version, to_version, component_ids } = args;
 		const mode: DiffMode = args.mode ?? "standard";
 		try {
 			const url = fileUrl || getCurrentUrl();
 			if (!url) {
-				return errorResponse(
-					"no_file_url",
-					"No Figma file URL available. Pass the fileUrl parameter or ensure the Desktop Bridge plugin is open in Figma.",
-				);
+				return {
+					ok: false,
+					error: "no_file_url",
+					message:
+						"No Figma file URL available. Pass the fileUrl parameter or ensure the Desktop Bridge plugin is open in Figma.",
+				};
 			}
 			const fileKey = extractFileKey(url);
 			if (!fileKey) {
-				return errorResponse("invalid_url", `Invalid Figma URL: ${url}`);
+				return { ok: false, error: "invalid_url", message: `Invalid Figma URL: ${url}` };
 			}
 			if (from_version === to_version) {
-				return errorResponse(
-					"same_version",
-					"from_version and to_version are identical — nothing to diff.",
-				);
+				return {
+					ok: false,
+					error: "same_version",
+					message: "from_version and to_version are identical — nothing to diff.",
+				};
 			}
 
 			logger.info(
@@ -527,7 +546,7 @@ export function registerVersionTools(
 
 			const scopedChanged = scoped.filter((n) => n.change_count > 0).length;
 
-			const result = {
+			const data = {
 				file_key: fileKey,
 				from: fromMeta,
 				to: toMeta,
@@ -547,12 +566,12 @@ export function registerVersionTools(
 			};
 
 			return {
-				content: [
-					{
-						type: "text" as const,
-						text: JSON.stringify(result),
-					},
-				],
+				ok: true,
+				data,
+				fileKey,
+				fileName: fromFile.data?.name ?? toFile.data?.name ?? "",
+				fromFile: fromFile.data,
+				toFile: toFile.data,
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -562,8 +581,75 @@ export function registerVersionTools(
 				: message.includes("404")
 					? " Hint: a version_id may have been pruned or may not belong to this file. Use figma_get_file_versions to list valid IDs."
 					: "";
-			return errorResponse("diff_versions_failed", message + hint);
+			return { ok: false, error: "diff_versions_failed", message: message + hint };
 		}
+	};
+
+	// Thin wrapper: call computeDiff and format the response for the MCP tool
+	// surface. Used by figma_diff_versions and figma_get_changes_since_version.
+	const runDiff = async (args: {
+		fileUrl?: string;
+		from_version: string;
+		to_version: string;
+		component_ids?: string[];
+		mode?: DiffMode;
+	}) => {
+		const result = await computeDiff(args);
+		if (!result.ok) {
+			return errorResponse(result.error, result.message);
+		}
+		return {
+			content: [{ type: "text" as const, text: JSON.stringify(result.data) }],
+		};
+	};
+
+	// Author/label/timestamp lookup for specific version IDs. Paginates
+	// figma_get_file_versions until both targets are found OR a hard lookback
+	// cap is hit. Returns null entries for any versions not found within
+	// the cap. Never throws — enrichment is best-effort.
+	const findVersionAuthorMetadata = async (
+		api: FigmaAPI,
+		fileKey: string,
+		versionIds: string[],
+	): Promise<Map<string, VersionAuthorMeta | null>> => {
+		const result = new Map<string, VersionAuthorMeta | null>();
+		for (const id of versionIds) result.set(id, null);
+		const wanted = new Set(versionIds.filter((id) => !isCurrentSentinel(id)));
+		if (wanted.size === 0) return result;
+
+		const MAX_PAGES = 4; // 4 × 50 = 200 versions of lookback
+		let cursor: string | undefined;
+		for (let page = 0; page < MAX_PAGES && wanted.size > 0; page++) {
+			let response: any;
+			try {
+				response = await api.getFileVersions(fileKey, {
+					page_size: 50,
+					after: cursor,
+				});
+			} catch (e) {
+				logger.warn({ err: e }, "Author enrichment lookup failed; continuing without it");
+				break;
+			}
+			const versions = response?.versions || [];
+			if (versions.length === 0) break;
+			for (const v of versions) {
+				if (wanted.has(v.id)) {
+					result.set(v.id, {
+						version_id: v.id,
+						label: v.label || null,
+						created_at: v.created_at || null,
+						user_handle: v.user?.handle || null,
+					});
+					wanted.delete(v.id);
+				}
+			}
+			if (wanted.size === 0) break;
+			if (!response?.pagination?.next_page) break;
+			const last = versions[versions.length - 1];
+			if (!last?.id || last.id === cursor) break;
+			cursor = last.id;
+		}
+		return result;
 	};
 
 	// -----------------------------------------------------------------------
@@ -630,6 +716,111 @@ export function registerVersionTools(
 				mode: mode as DiffMode | undefined,
 			}),
 	);
+
+	// -----------------------------------------------------------------------
+	// Tool: figma_generate_changelog
+	// -----------------------------------------------------------------------
+	server.tool(
+		"figma_generate_changelog",
+		"Generate a human-readable markdown changelog between two versions. Wraps figma_diff_versions and enriches the output with author labels and timestamps via figma_get_file_versions lookback (one extra cheap API call). Returns BOTH a `markdown` string (paste into release notes / PRs / Storybook MDX) and the structured diff data. Same component_ids and mode semantics as figma_diff_versions. Use 'current' for to_version to changelog against HEAD.",
+		{
+			fileUrl: z
+				.string()
+				.url()
+				.optional()
+				.describe("Figma file URL. Uses current URL if omitted."),
+			from_version: z
+				.string()
+				.describe("The earlier version_id. Get from figma_get_file_versions."),
+			to_version: z
+				.string()
+				.describe("The later version_id. Use 'current' for HEAD."),
+			component_ids: z
+				.array(z.string())
+				.optional()
+				.describe("Optional. Node IDs to include in the per-component changelog section."),
+			mode: z
+				.enum(["summary", "standard", "detailed"])
+				.optional()
+				.default("standard")
+				.describe("Output verbosity. summary=one-liner, standard=sectioned with counts (default), detailed=full per-property/per-binding bullets."),
+		},
+		async ({ fileUrl, from_version, to_version, component_ids, mode }) => {
+			const effectiveMode: DiffMode = (mode as DiffMode | undefined) ?? "standard";
+			try {
+				const result = await computeDiff({
+					fileUrl,
+					from_version,
+					to_version,
+					component_ids,
+					mode: effectiveMode,
+				});
+				if (!result.ok) {
+					return errorResponse(result.error, result.message);
+				}
+
+				// Best-effort author enrichment. If lookup fails or comes up empty,
+				// the formatter degrades gracefully.
+				const api = await getFigmaAPI();
+				const idsToLookup = [from_version, to_version].filter(
+					(id) => !isCurrentSentinel(id),
+				);
+				const authorMap = idsToLookup.length > 0
+					? await findVersionAuthorMetadata(api, result.fileKey, idsToLookup)
+					: new Map<string, VersionAuthorMeta | null>();
+
+				let fromMeta: VersionAuthorMeta | null = isCurrentSentinel(from_version)
+					? buildHeadMeta(result.fromFile)
+					: authorMap.get(from_version) ?? null;
+				let toMeta: VersionAuthorMeta | null = isCurrentSentinel(to_version)
+					? buildHeadMeta(result.toFile)
+					: authorMap.get(to_version) ?? null;
+
+				const markdown = formatChangelogMarkdown(
+					{
+						file_key: result.fileKey,
+						file_name: result.fileName || null,
+						from_version_id: from_version,
+						to_version_id: to_version,
+						from_meta: fromMeta,
+						to_meta: toMeta,
+						page_structure: result.data.page_structure,
+						scoped_nodes: result.data.scoped_nodes,
+						notes: result.data.notes,
+					},
+					effectiveMode,
+				);
+
+				const response = {
+					markdown,
+					structured: result.data,
+					_meta: {
+						authors_enriched: idsToLookup.length > 0,
+						from_author_found: !!fromMeta && !fromMeta.is_head,
+						to_author_found: !!toMeta && !toMeta.is_head,
+					},
+				};
+
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify(response) }],
+				};
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logger.error({ error }, "Failed to generate changelog");
+				return errorResponse("generate_changelog_failed", message);
+			}
+		},
+	);
+}
+
+function buildHeadMeta(fileData: any): VersionAuthorMeta {
+	return {
+		version_id: fileData?.version ?? "current",
+		label: null,
+		created_at: fileData?.lastModified ?? null,
+		user_handle: null,
+		is_head: true,
+	};
 }
 
 // ============================================================================

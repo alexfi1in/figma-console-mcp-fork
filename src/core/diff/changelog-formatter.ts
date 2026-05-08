@@ -142,23 +142,32 @@ function appendComponentBlock(lines: string[], n: NodeDiff, mode: DiffMode): voi
 	const heading = n.node_name ? `${n.node_name}` : "(unnamed)";
 	lines.push(`### ${escapeMd(heading)} — \`${n.node_id}\``);
 	lines.push(`**${n.change_count} change${n.change_count === 1 ? "" : "s"}**`);
-	lines.push("");
 
+	// Each subsequent sub-section adds its own single-blank-line separator so
+	// we don't end up with two consecutive blank lines when one of these
+	// sub-sections is empty. (Earlier versions unconditionally pushed a blank
+	// after the change count then again before each sub-section, producing
+	// double-blanks in the common case.)
+	const bullets: string[] = [];
 	if (n.name_changed) {
-		lines.push(`- Renamed: \`${escapeMd(n.name_changed.from)}\` → \`${escapeMd(n.name_changed.to)}\``);
+		bullets.push(`- Renamed: \`${escapeMd(n.name_changed.from)}\` → \`${escapeMd(n.name_changed.to)}\``);
 	}
 	if (n.description_changed) {
 		const fromLen = n.description_changed.from.length;
 		const toLen = n.description_changed.to.length;
-		lines.push(`- Description changed (${fromLen} → ${toLen} chars)`);
+		bullets.push(`- Description changed (${fromLen} → ${toLen} chars)`);
 	}
 	if (n.children_added.length > 0) {
 		const inline = n.children_added.map((c) => `\`${escapeMd(c.name || c.id)}\``).join(", ");
-		lines.push(`- Children added (${n.children_added.length}): ${inline}`);
+		bullets.push(`- Children added (${n.children_added.length}): ${inline}`);
 	}
 	if (n.children_removed.length > 0) {
 		const inline = n.children_removed.map((c) => `\`${escapeMd(c.name || c.id)}\``).join(", ");
-		lines.push(`- Children removed (${n.children_removed.length}): ${inline}`);
+		bullets.push(`- Children removed (${n.children_removed.length}): ${inline}`);
+	}
+	if (bullets.length > 0) {
+		lines.push("");
+		lines.push(...bullets);
 	}
 
 	if (n.component_properties && hasAnyPropChanges(n.component_properties.summary)) {

@@ -5984,6 +5984,12 @@ return {
 			this.server,
 			() => this.getFigmaAPI(),
 			() => this.getCurrentFileUrl(),
+			undefined, // options
+			() => {
+				// Selection fallback for blame/diff/changelog tools
+				const sel = this.wsServer?.getCurrentSelection();
+				return sel?.nodes?.map((n) => n.id) ?? null;
+			},
 		);
 
 		// Register Design System Kit tool

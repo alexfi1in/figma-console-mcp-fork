@@ -1111,4 +1111,183 @@ describe("Version Tools", () => {
 			expect(data.introduced_at.version_id).toBe("vLabeled");
 		});
 	});
+
+	// -----------------------------------------------------------------------
+	// Selection fallback (Phase 5)
+	// -----------------------------------------------------------------------
+	describe("selection fallback", () => {
+		const makeFileResp = (pages: Array<{ id: string; name: string }> = []) => ({
+			document: {
+				id: "0:0",
+				name: "Document",
+				type: "DOCUMENT",
+				children: pages.map((p) => ({ id: p.id, name: p.name, type: "CANVAS" })),
+			},
+			name: "Test File",
+			version: "VRES",
+			lastModified: "2026-01-01T00:00:00Z",
+		});
+		const makeNodeResp = (nodeId: string, hasProperty: boolean) => ({
+			version: "VANY",
+			lastModified: "2026-01-01T00:00:00Z",
+			nodes: {
+				[nodeId]: {
+					document: {
+						id: nodeId,
+						name: "Selected Node",
+						type: "COMPONENT_SET",
+						componentPropertyDefinitions: hasProperty
+							? { "Disabled#1:2": { type: "BOOLEAN", defaultValue: false } }
+							: {},
+						children: [],
+					},
+				},
+			},
+		});
+
+		// Helper: register version tools with a custom selection getter
+		const registerWithSelection = (selectedIds: string[] | null) => {
+			const s = createMockServer();
+			registerVersionTools(
+				s as any,
+				async () => mockApi as any,
+				() => MOCK_FILE_URL,
+				undefined,
+				() => selectedIds,
+			);
+			return s;
+		};
+
+		it("figma_blame_node uses selected node when node_id is omitted", async () => {
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				return makeNodeResp("999:1", opts?.version === "vStart");
+			});
+			mockApi.getFileVersions.mockResolvedValueOnce({
+				versions: [
+					{
+						id: "vStart",
+						label: "start",
+						description: "",
+						created_at: "2026-01-01T00:00:00Z",
+						user: { id: "u-tj", handle: "tj", img_url: "" },
+					},
+					{
+						id: "v0",
+						label: "",
+						description: "",
+						created_at: "2025-12-01T00:00:00Z",
+						user: { id: "u-alice", handle: "alice", img_url: "" },
+					},
+				],
+				pagination: { prev_page: null, next_page: null },
+			});
+
+			const s = registerWithSelection(["999:1"]);
+			const tool = s._getTool("figma_blame_node");
+			const result = await tool.handler({
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.node_id).toBe("999:1");
+			expect(data.summary.used_selection).toBe(true);
+			expect(data.notes.some((n: string) => n.includes("Auto-scoped"))).toBe(true);
+		});
+
+		it("figma_blame_node errors helpfully when node_id omitted and no selection", async () => {
+			const s = registerWithSelection(null);
+			const tool = s._getTool("figma_blame_node");
+			const result = await tool.handler({ target_component_property: "Foo#1:1" });
+
+			expect(result.isError).toBe(true);
+			const data = JSON.parse(result.content[0].text);
+			expect(data.error).toBe("no_node_id");
+			expect(data.message).toContain("select a node first");
+		});
+
+		it("figma_blame_node ignores selection when node_id is explicitly passed", async () => {
+			mockApi.getNodes.mockResolvedValue(makeNodeResp("explicit:1", true));
+			mockApi.getFileVersions.mockResolvedValueOnce({
+				versions: [],
+				pagination: { prev_page: null, next_page: null },
+			});
+
+			const s = registerWithSelection(["selected:1"]);
+			const tool = s._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "explicit:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.node_id).toBe("explicit:1");
+			expect(data.summary.used_selection).toBe(false);
+		});
+
+		it("figma_diff_versions auto-scopes to selection when component_ids omitted", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp());
+			mockApi.getNodes.mockResolvedValue(makeNodeResp("777:7", true));
+
+			const s = registerWithSelection(["777:7"]);
+			const tool = s._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.summary.used_selection).toBe(true);
+			expect(data.summary.scoped_nodes_requested).toBe(1);
+			expect(data.scoped_nodes).toHaveLength(1);
+			expect(data.scoped_nodes[0].node_id).toBe("777:7");
+			expect(data.notes.some((n: string) => n.includes("Auto-scoped"))).toBe(true);
+		});
+
+		it("figma_diff_versions falls back to page-only diff when no selection", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
+
+			const s = registerWithSelection(null);
+			const tool = s._getTool("figma_diff_versions");
+			const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.summary.used_selection).toBe(false);
+			expect(data.summary.scoped_nodes_requested).toBe(0);
+			expect(data.scoped_nodes).toBeUndefined();
+		});
+
+		it("figma_diff_versions explicit component_ids overrides selection", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp());
+			mockApi.getNodes.mockResolvedValue(makeNodeResp("explicit:1", true));
+
+			const s = registerWithSelection(["selected:1"]);
+			const tool = s._getTool("figma_diff_versions");
+			const result = await tool.handler({
+				from_version: "vA",
+				to_version: "vB",
+				component_ids: ["explicit:1"],
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.summary.used_selection).toBe(false);
+			expect(data.scoped_nodes[0].node_id).toBe("explicit:1");
+		});
+
+		it("figma_diff_versions explicit empty array opts out of selection fallback", async () => {
+			mockApi.getFile.mockResolvedValue(makeFileResp([{ id: "1:0", name: "Page A" }]));
+
+			const s = registerWithSelection(["selected:1"]);
+			const tool = s._getTool("figma_diff_versions");
+			const result = await tool.handler({
+				from_version: "vA",
+				to_version: "vB",
+				component_ids: [],
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.summary.used_selection).toBe(false);
+			expect(data.summary.scoped_nodes_requested).toBe(0);
+		});
+	});
 });

@@ -140,7 +140,15 @@ export function registerVersionTools(
 	getFigmaAPI: () => Promise<FigmaAPI>,
 	getCurrentUrl: () => string | null,
 	_options?: { isRemoteMode?: boolean },
+	getCurrentSelectedNodeIds?: () => string[] | null,
 ): void {
+	// Helper: read the current Figma selection as a list of node IDs, or null
+	// if no selection getter is wired (cloud mode) or selection is empty.
+	const readSelection = (): string[] | null => {
+		if (!getCurrentSelectedNodeIds) return null;
+		const ids = getCurrentSelectedNodeIds();
+		return ids && ids.length > 0 ? ids : null;
+	};
 	// -----------------------------------------------------------------------
 	// Tool: figma_get_file_versions
 	// -----------------------------------------------------------------------
@@ -451,11 +459,25 @@ export function registerVersionTools(
 				fileName: string;
 				fromFile: any;
 				toFile: any;
+				usedSelection: boolean;
 		  }
 		| { ok: false; error: string; message: string }
 	> => {
-		const { fileUrl, from_version, to_version, component_ids } = args;
+		const { fileUrl, from_version, to_version } = args;
 		const mode: DiffMode = args.mode ?? "standard";
+
+		// Selection fallback: if caller didn't pass component_ids, use the
+		// current Figma selection (if any). Empty array is treated as "no
+		// scope" (intentional opt-out), undefined triggers the fallback.
+		let component_ids = args.component_ids;
+		let usedSelection = false;
+		if (component_ids === undefined) {
+			const selectedIds = readSelection();
+			if (selectedIds) {
+				component_ids = selectedIds;
+				usedSelection = true;
+			}
+		}
 		try {
 			const url = fileUrl || getCurrentUrl();
 			if (!url) {
@@ -532,7 +554,12 @@ export function registerVersionTools(
 			const notes: string[] = [];
 			if (!component_ids || component_ids.length === 0) {
 				notes.push(
-					"Only page-structure diff returned. Pass component_ids to get per-component analysis (added/removed children, property changes, binding changes).",
+					"Only page-structure diff returned. Pass component_ids to get per-component analysis (added/removed children, property changes, binding changes), or have a node selected in Figma when you call.",
+				);
+			}
+			if (usedSelection) {
+				notes.push(
+					`Auto-scoped to ${component_ids?.length ?? 0} node(s) from the current Figma selection. Pass component_ids explicitly to override.`,
 				);
 			}
 			notes.push(
@@ -558,6 +585,7 @@ export function registerVersionTools(
 					scoped_nodes_requested: component_ids?.length ?? 0,
 					scoped_nodes_returned: scoped.length,
 					scoped_nodes_with_changes: scopedChanged,
+					used_selection: usedSelection,
 					api_calls_made: apiCalls,
 					cache_hits: cacheHits,
 				},
@@ -572,6 +600,7 @@ export function registerVersionTools(
 				fileName: fromFile.data?.name ?? toFile.data?.name ?? "",
 				fromFile: fromFile.data,
 				toFile: toFile.data,
+				usedSelection,
 			};
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -673,7 +702,7 @@ export function registerVersionTools(
 			component_ids: z
 				.array(z.string())
 				.optional()
-				.describe("Optional. Node IDs (typically COMPONENT_SETs) to diff in detail. Without this you only get the page-structure diff. Use figma_get_design_system_kit or figma_search_components to discover IDs."),
+				.describe("Optional. Node IDs (typically COMPONENT_SETs) to diff in detail. If omitted, falls back to the current Figma selection. If neither is available, only the page-structure diff is returned. Use figma_get_design_system_kit or figma_search_components to discover IDs explicitly."),
 			mode: z
 				.enum(["summary", "standard", "detailed"])
 				.optional()
@@ -701,7 +730,7 @@ export function registerVersionTools(
 			component_ids: z
 				.array(z.string())
 				.optional()
-				.describe("Optional. Node IDs to diff in detail. Same semantics as figma_diff_versions."),
+				.describe("Optional. Node IDs to diff in detail. If omitted, falls back to the current Figma selection. Same semantics as figma_diff_versions otherwise."),
 			mode: z
 				.enum(["summary", "standard", "detailed"])
 				.optional()
@@ -738,7 +767,7 @@ export function registerVersionTools(
 			component_ids: z
 				.array(z.string())
 				.optional()
-				.describe("Optional. Node IDs to include in the per-component changelog section."),
+				.describe("Optional. Node IDs to include in the per-component changelog section. If omitted, falls back to the current Figma selection."),
 			mode: z
 				.enum(["summary", "standard", "detailed"])
 				.optional()
@@ -817,7 +846,7 @@ export function registerVersionTools(
 	// -----------------------------------------------------------------------
 	server.tool(
 		"figma_blame_node",
-		"Find the version that introduced a specific change to a node — answers 'who/when added this'. Walks version history backward via binary search (~log2(N) API calls instead of N) to localize the introduction point. Returns the version's metadata (label/author/timestamp). Default includes autosaves for finer attribution; system 'Figma' user appears occasionally for scheduled snapshots and is flagged via attribution_certainty='system_attributed'. Specify EXACTLY ONE of target_component_property or target_child_node_id.",
+		"Find the version that introduced a specific change to a node — answers 'who/when added this'. Walks version history backward via binary search (~log2(N) API calls instead of N) to localize the introduction point. Returns the version's metadata (label/author/timestamp). Default includes autosaves for finer attribution; system 'Figma' user appears occasionally for scheduled snapshots and is flagged via attribution_certainty='system_attributed'. Specify EXACTLY ONE of target_component_property or target_child_node_id. node_id is optional — if omitted, falls back to the first node in the current Figma selection.",
 		{
 			fileUrl: z
 				.string()
@@ -826,7 +855,8 @@ export function registerVersionTools(
 				.describe("Figma file URL. Uses current URL if omitted."),
 			node_id: z
 				.string()
-				.describe("The parent node ID to inspect (typically a COMPONENT_SET)."),
+				.optional()
+				.describe("The parent node ID to inspect (typically a COMPONENT_SET). If omitted, falls back to the first node in the current Figma selection."),
 			target_component_property: z
 				.string()
 				.optional()
@@ -867,6 +897,22 @@ export function registerVersionTools(
 			const includeAuto = include_autosaves ?? true;
 			const startVer = start_version ?? CURRENT_VERSION_SENTINEL;
 			try {
+				// Selection fallback: if node_id is omitted, use the first selected node.
+				let resolvedNodeId = node_id;
+				let usedSelection = false;
+				if (!resolvedNodeId) {
+					const selectedIds = readSelection();
+					if (selectedIds && selectedIds.length > 0) {
+						resolvedNodeId = selectedIds[0];
+						usedSelection = true;
+					} else {
+						return errorResponse(
+							"no_node_id",
+							"No node_id provided and no node is currently selected in Figma. Pass node_id explicitly or select a node first.",
+						);
+					}
+				}
+
 				// Validate exactly one target type
 				const targets = [target_component_property, target_child_node_id].filter(
 					(t) => t !== undefined && t !== null,
@@ -893,7 +939,8 @@ export function registerVersionTools(
 				logger.info(
 					{
 						fileKey,
-						node_id,
+						node_id: resolvedNodeId,
+						usedSelection,
 						target_component_property,
 						target_child_node_id,
 						startVer,
@@ -908,14 +955,14 @@ export function registerVersionTools(
 				let cacheHits = 0;
 
 				// Step 1: Confirm target exists at start_version
-				const startResp = await fetchNodeAtVersion(api, fileKey, node_id, startVer);
+				const startResp = await fetchNodeAtVersion(api, fileKey, resolvedNodeId, startVer);
 				if (startResp.cached) cacheHits++;
 				else apiCalls++;
-				const startNode = startResp.data?.nodes?.[node_id]?.document ?? null;
+				const startNode = startResp.data?.nodes?.[resolvedNodeId]?.document ?? null;
 				if (!startNode) {
 					return errorResponse(
 						"node_not_at_start",
-						`Node ${node_id} not found at start_version. Verify the node_id and start_version.`,
+						`Node ${resolvedNodeId} not found at start_version. Verify the node_id and start_version.`,
 					);
 				}
 				if (!targetExists(startNode, { target_component_property, target_child_node_id })) {
@@ -955,10 +1002,10 @@ export function registerVersionTools(
 				while (lo <= hi) {
 					const mid = Math.floor((lo + hi) / 2);
 					const midVer = versions[mid].id;
-					const resp = await fetchNodeAtVersion(api, fileKey, node_id, midVer);
+					const resp = await fetchNodeAtVersion(api, fileKey, resolvedNodeId, midVer);
 					if (resp.cached) cacheHits++;
 					else apiCalls++;
-					const midNode = resp.data?.nodes?.[node_id]?.document ?? null;
+					const midNode = resp.data?.nodes?.[resolvedNodeId]?.document ?? null;
 					const exists = midNode
 						? targetExists(midNode, {
 								target_component_property,
@@ -1041,9 +1088,15 @@ export function registerVersionTools(
 					"Binary search assumes the target's existence is monotonic (added once, never removed). If the target was added, removed, then re-added, this tool may report a different introduction point than the original.",
 				);
 
+				if (usedSelection) {
+					notes.push(
+						`Auto-scoped to node ${resolvedNodeId} from the current Figma selection. Pass node_id explicitly to override.`,
+					);
+				}
+
 				const result = {
 					file_key: fileKey,
-					node_id,
+					node_id: resolvedNodeId,
 					target: target_component_property
 						? { type: "component_property", name: target_component_property }
 						: { type: "child_node", node_id: target_child_node_id },
@@ -1052,6 +1105,7 @@ export function registerVersionTools(
 					summary: {
 						versions_in_search_range: versions.length,
 						probes_made: probedExists.size,
+						used_selection: usedSelection,
 						api_calls_made: apiCalls,
 						cache_hits: cacheHits,
 					},

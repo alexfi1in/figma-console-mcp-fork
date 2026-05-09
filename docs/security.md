@@ -123,7 +123,7 @@ Southleft does **not currently hold SOC 2, ISO 27001, or equivalent third-party 
 - No data persistence, telemetry, or analytics
 - No accounts, no user database, no logs leaving your machine
 
-The complete source is MIT-licensed and available for audit on [GitHub](https://github.com/southleft/figma-console-mcp). Releases are published to npm as [`@southleft/figma-console-mcp`](https://www.npmjs.com/package/@southleft/figma-console-mcp).
+The complete source is MIT-licensed and available for audit on [GitHub](https://github.com/southleft/figma-console-mcp). Releases are published to npm as [`figma-console-mcp`](https://www.npmjs.com/package/figma-console-mcp).
 
 ### Data Processing & DPA
 

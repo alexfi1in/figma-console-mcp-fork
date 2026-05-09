@@ -811,6 +811,352 @@ export function registerVersionTools(
 			}
 		},
 	);
+
+	// -----------------------------------------------------------------------
+	// Tool: figma_blame_node
+	// -----------------------------------------------------------------------
+	server.tool(
+		"figma_blame_node",
+		"Find the version that introduced a specific change to a node — answers 'who/when added this'. Walks version history backward via binary search (~log2(N) API calls instead of N) to localize the introduction point. Returns the version's metadata (label/author/timestamp). Default includes autosaves for finer attribution; system 'Figma' user appears occasionally for scheduled snapshots and is flagged via attribution_certainty='system_attributed'. Specify EXACTLY ONE of target_component_property or target_child_node_id.",
+		{
+			fileUrl: z
+				.string()
+				.url()
+				.optional()
+				.describe("Figma file URL. Uses current URL if omitted."),
+			node_id: z
+				.string()
+				.describe("The parent node ID to inspect (typically a COMPONENT_SET)."),
+			target_component_property: z
+				.string()
+				.optional()
+				.describe("A componentPropertyDefinitions key (e.g. 'Disabled#1:2') — find when this property was first added to the node."),
+			target_child_node_id: z
+				.string()
+				.optional()
+				.describe("A descendant node ID — find when this child was first added under node_id."),
+			start_version: z
+				.string()
+				.optional()
+				.default("current")
+				.describe("Version to walk backward from. Default 'current' (HEAD)."),
+			max_versions_to_walk: z
+				.number()
+				.int()
+				.min(2)
+				.max(500)
+				.optional()
+				.default(200)
+				.describe("Lookback cap. Binary search probes ~log2(N) of these. Default 200, max 500."),
+			include_autosaves: z
+				.boolean()
+				.optional()
+				.default(true)
+				.describe("Include auto-saved versions in the search range. Default true (better attribution accuracy; most autosaves carry the real human user)."),
+		},
+		async ({
+			fileUrl,
+			node_id,
+			target_component_property,
+			target_child_node_id,
+			start_version,
+			max_versions_to_walk,
+			include_autosaves,
+		}) => {
+			const lookback = max_versions_to_walk ?? 200;
+			const includeAuto = include_autosaves ?? true;
+			const startVer = start_version ?? CURRENT_VERSION_SENTINEL;
+			try {
+				// Validate exactly one target type
+				const targets = [target_component_property, target_child_node_id].filter(
+					(t) => t !== undefined && t !== null,
+				);
+				if (targets.length !== 1) {
+					return errorResponse(
+						"invalid_target",
+						"Specify exactly one of target_component_property or target_child_node_id.",
+					);
+				}
+
+				const url = fileUrl || getCurrentUrl();
+				if (!url) {
+					return errorResponse(
+						"no_file_url",
+						"No Figma file URL available. Pass the fileUrl parameter or ensure the Desktop Bridge plugin is open in Figma.",
+					);
+				}
+				const fileKey = extractFileKey(url);
+				if (!fileKey) {
+					return errorResponse("invalid_url", `Invalid Figma URL: ${url}`);
+				}
+
+				logger.info(
+					{
+						fileKey,
+						node_id,
+						target_component_property,
+						target_child_node_id,
+						startVer,
+						lookback,
+						includeAuto,
+					},
+					"Blaming node",
+				);
+
+				const api = await getFigmaAPI();
+				let apiCalls = 0;
+				let cacheHits = 0;
+
+				// Step 1: Confirm target exists at start_version
+				const startResp = await fetchNodeAtVersion(api, fileKey, node_id, startVer);
+				if (startResp.cached) cacheHits++;
+				else apiCalls++;
+				const startNode = startResp.data?.nodes?.[node_id]?.document ?? null;
+				if (!startNode) {
+					return errorResponse(
+						"node_not_at_start",
+						`Node ${node_id} not found at start_version. Verify the node_id and start_version.`,
+					);
+				}
+				if (!targetExists(startNode, { target_component_property, target_child_node_id })) {
+					return errorResponse(
+						"target_not_at_start",
+						`Target was not found at start_version. The blame walker requires the target to exist at start_version (you're asking 'when was this introduced'). If you're tracking something that was REMOVED, you want to look in the opposite direction — pick a start_version where it still existed.`,
+					);
+				}
+
+				// Step 2: Build the candidate version list — versions strictly OLDER than start.
+				// Use the file's resolved version id (not the 'current' sentinel) so the
+				// collector can correctly skip past start to begin collecting older versions.
+				const resolvedStartVer: string = isCurrentSentinel(startVer)
+					? (startResp.data as any)?.version || startVer
+					: startVer;
+				const candidates = await collectCandidateVersions(
+					api,
+					fileKey,
+					resolvedStartVer,
+					lookback,
+					includeAuto,
+				);
+				apiCalls += candidates.apiCalls;
+				cacheHits += candidates.cacheHits;
+				const versions = candidates.versions; // newest-first, all OLDER than start
+
+				// Step 3: Binary search for the LARGEST index (oldest version) where target exists.
+				// Existence is assumed monotonic: if target exists at an OLDER version (larger
+				// index), it must also exist at all NEWER versions up to start. We search for
+				// the OLDEST version that still has the target — that's the introduction point.
+				// Empty range is fine (handled below).
+				let lo = 0;
+				let hi = versions.length - 1;
+				const probedExists = new Map<number, boolean>();
+				let oldestExistsIdx = -1;
+
+				while (lo <= hi) {
+					const mid = Math.floor((lo + hi) / 2);
+					const midVer = versions[mid].id;
+					const resp = await fetchNodeAtVersion(api, fileKey, node_id, midVer);
+					if (resp.cached) cacheHits++;
+					else apiCalls++;
+					const midNode = resp.data?.nodes?.[node_id]?.document ?? null;
+					const exists = midNode
+						? targetExists(midNode, {
+								target_component_property,
+								target_child_node_id,
+							})
+						: false;
+					probedExists.set(mid, exists);
+					if (exists) {
+						if (mid > oldestExistsIdx) oldestExistsIdx = mid;
+						lo = mid + 1; // search older
+					} else {
+						hi = mid - 1; // search newer
+					}
+				}
+
+				// Three outcomes:
+				//   oldestExistsIdx === -1            -> target introduced AT start_version itself
+				//   oldestExistsIdx === versions.len-1 -> introduction is OLDER than our lookback
+				//   otherwise                          -> oldestExistsIdx is the introduction point
+				const notes: string[] = [];
+				let introducedVersionMeta: {
+					version_id: string;
+					label: string | null;
+					created_at: string | null;
+					user_handle: string | null;
+					is_labeled: boolean;
+				};
+				let certainty: string;
+
+				if (oldestExistsIdx === -1) {
+					// Target was introduced at start_version itself. Look up start's metadata.
+					const lookupId = isCurrentSentinel(startVer) ? resolvedStartVer : startVer;
+					const authorMap = await findVersionAuthorMetadata(api, fileKey, [lookupId]);
+					apiCalls += 1; // helper makes 1-4 paginated calls; conservative under-count
+					const meta = authorMap.get(lookupId);
+					introducedVersionMeta = {
+						version_id: lookupId,
+						label: meta?.label ?? null,
+						created_at:
+							meta?.created_at ?? (startResp.data as any)?.lastModified ?? null,
+						user_handle: meta?.user_handle ?? null,
+						is_labeled: !!(meta?.label && meta.label !== ""),
+					};
+					certainty =
+						introducedVersionMeta.user_handle === "Figma"
+							? "system_attributed"
+							: introducedVersionMeta.user_handle
+								? "exact"
+								: "metadata_unavailable";
+					if (certainty === "metadata_unavailable") {
+						notes.push(
+							"Target was introduced at start_version itself, but author metadata for that version was not found within the version-list lookback. The introduction is real; the user is just not attributable from REST data alone.",
+						);
+					}
+				} else {
+					const introducedVersion = versions[oldestExistsIdx];
+					introducedVersionMeta = {
+						version_id: introducedVersion.id,
+						label: introducedVersion.label || null,
+						created_at: introducedVersion.created_at,
+						user_handle: introducedVersion.user?.handle ?? null,
+						is_labeled: !!(introducedVersion.label && introducedVersion.label !== ""),
+					};
+					if (oldestExistsIdx === versions.length - 1) {
+						certainty = "exists_at_lookback_horizon";
+						notes.push(
+							`Target also exists at the oldest scanned version (${introducedVersion.id}). The actual introduction is older than the search range. Increase max_versions_to_walk (currently ${lookback}) to keep searching.`,
+						);
+					} else if (introducedVersionMeta.user_handle === "Figma") {
+						certainty = "system_attributed";
+						notes.push(
+							"The introduction version was a system-triggered autosave (user='Figma'). For a human author, set include_autosaves=false and re-run — that finds the nearest LABELED version that includes the change.",
+						);
+					} else {
+						certainty = "exact";
+					}
+				}
+
+				notes.push(
+					"Binary search assumes the target's existence is monotonic (added once, never removed). If the target was added, removed, then re-added, this tool may report a different introduction point than the original.",
+				);
+
+				const result = {
+					file_key: fileKey,
+					node_id,
+					target: target_component_property
+						? { type: "component_property", name: target_component_property }
+						: { type: "child_node", node_id: target_child_node_id },
+					introduced_at: introducedVersionMeta,
+					attribution_certainty: certainty,
+					summary: {
+						versions_in_search_range: versions.length,
+						probes_made: probedExists.size,
+						api_calls_made: apiCalls,
+						cache_hits: cacheHits,
+					},
+					notes,
+				};
+
+				return {
+					content: [{ type: "text" as const, text: JSON.stringify(result) }],
+				};
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logger.error({ error }, "Blame walker failed");
+				const hint = message.includes("403")
+					? " Hint: ensure your token has both file_content:read and file_versions:read scopes."
+					: message.includes("404")
+						? " Hint: a node or version may not exist. Verify node_id and start_version."
+						: "";
+				return errorResponse("blame_node_failed", message + hint);
+			}
+		},
+	);
+
+	// Build the candidate version list for binary search. Returns versions
+	// strictly OLDER than start_version (so the search range doesn't include
+	// the version we already confirmed at), capped at lookback. Newest-first.
+	const collectCandidateVersions = async (
+		api: FigmaAPI,
+		fileKey: string,
+		startVer: string,
+		lookback: number,
+		includeAutosaves: boolean,
+	): Promise<{
+		versions: Array<{
+			id: string;
+			label: string;
+			created_at: string;
+			user: { id: string; handle: string; img_url: string };
+		}>;
+		apiCalls: number;
+		cacheHits: number;
+	}> => {
+		const collected: Array<any> = [];
+		let cursor: string | undefined;
+		let apiCalls = 0;
+		const cacheHits = 0; // version-list pagination is not snapshot-cached
+		// Once we hit start_version's id in the list, switch to "collecting older" mode
+		let foundStart = isCurrentSentinel(startVer);
+		const MAX_PAGES = 10; // 10 × 50 = 500 versions hard cap on scan
+		for (let page = 0; page < MAX_PAGES && collected.length < lookback; page++) {
+			let response: any;
+			try {
+				response = await api.getFileVersions(fileKey, {
+					page_size: 50,
+					after: cursor,
+				});
+				apiCalls++;
+			} catch (e) {
+				logger.warn({ err: e }, "Version list fetch failed during blame walk");
+				break;
+			}
+			const versions = response?.versions || [];
+			if (versions.length === 0) break;
+			for (const v of versions) {
+				if (!foundStart) {
+					if (v.id === startVer) foundStart = true;
+					continue;
+				}
+				const isLabeled = v.label && v.label !== "";
+				if (!includeAutosaves && !isLabeled) continue;
+				collected.push(v);
+				if (collected.length >= lookback) break;
+			}
+			if (collected.length >= lookback) break;
+			if (!response?.pagination?.next_page) break;
+			const last = versions[versions.length - 1];
+			if (!last?.id || last.id === cursor) break;
+			cursor = last.id;
+		}
+		return { versions: collected, apiCalls, cacheHits };
+	};
+}
+
+// Returns true if the target is present in the given node tree.
+function targetExists(
+	node: any,
+	target: { target_component_property?: string; target_child_node_id?: string },
+): boolean {
+	if (target.target_component_property) {
+		return !!node?.componentPropertyDefinitions?.[target.target_component_property];
+	}
+	if (target.target_child_node_id) {
+		return findChildById(node, target.target_child_node_id);
+	}
+	return false;
+}
+
+function findChildById(node: any, targetId: string): boolean {
+	if (!node) return false;
+	if (node.id === targetId) return true;
+	if (Array.isArray(node.children)) {
+		for (const c of node.children) {
+			if (findChildById(c, targetId)) return true;
+		}
+	}
+	return false;
 }
 
 function buildHeadMeta(fileData: any): VersionAuthorMeta {

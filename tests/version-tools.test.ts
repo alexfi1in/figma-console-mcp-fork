@@ -91,14 +91,15 @@ describe("Version Tools", () => {
 		);
 	});
 
-	it("registers all five version tools", () => {
-		expect(server.tool).toHaveBeenCalledTimes(5);
+	it("registers all six version tools", () => {
+		expect(server.tool).toHaveBeenCalledTimes(6);
 		const names = server.tool.mock.calls.map((c: any[]) => c[0]);
 		expect(names).toContain("figma_get_file_versions");
 		expect(names).toContain("figma_get_file_at_version");
 		expect(names).toContain("figma_diff_versions");
 		expect(names).toContain("figma_get_changes_since_version");
 		expect(names).toContain("figma_generate_changelog");
+		expect(names).toContain("figma_blame_node");
 	});
 
 	// -----------------------------------------------------------------------
@@ -828,6 +829,286 @@ describe("Version Tools", () => {
 			expect(result.isError).toBeUndefined();
 			const data = JSON.parse(result.content[0].text);
 			expect(data.markdown).toContain("metadata not available");
+		});
+	});
+
+	// -----------------------------------------------------------------------
+	// figma_blame_node
+	// -----------------------------------------------------------------------
+	describe("figma_blame_node", () => {
+		// Helper: build a getNodes response where node "100:1" optionally has the
+		// target component property and/or a target child node.
+		const makeNodeResp = (opts: {
+			hasProperty?: boolean;
+			hasChild?: boolean;
+		}) => ({
+			version: "VANY",
+			lastModified: "2026-01-01T00:00:00Z",
+			nodes: {
+				"100:1": {
+					document: {
+						id: "100:1",
+						name: "Button",
+						type: "COMPONENT_SET",
+						componentPropertyDefinitions: opts.hasProperty
+							? { "Disabled#1:2": { type: "BOOLEAN", defaultValue: false } }
+							: {},
+						children: opts.hasChild
+							? [{ id: "999:9", name: "NewVariant", type: "COMPONENT" }]
+							: [],
+					},
+				},
+			},
+		});
+
+		// Helper: build a versions list response. Versions in newest-first order.
+		const makeVersionsList = (versions: Array<{ id: string; user: string; label?: string }>) => ({
+			versions: versions.map((v) => ({
+				id: v.id,
+				label: v.label ?? "",
+				description: "",
+				created_at: "2026-01-01T00:00:00Z",
+				user: { id: `u-${v.user}`, handle: v.user, img_url: "" },
+			})),
+			pagination: { prev_page: null, next_page: null },
+		});
+
+		it("rejects when neither target type is provided", async () => {
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({ node_id: "100:1" });
+			expect(result.isError).toBe(true);
+			expect(JSON.parse(result.content[0].text).error).toBe("invalid_target");
+		});
+
+		it("rejects when both target types are provided", async () => {
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Foo#1:1",
+				target_child_node_id: "999:9",
+			});
+			expect(result.isError).toBe(true);
+			expect(JSON.parse(result.content[0].text).error).toBe("invalid_target");
+		});
+
+		it("returns target_not_at_start when property doesn't exist at start", async () => {
+			mockApi.getNodes.mockResolvedValueOnce(makeNodeResp({ hasProperty: false }));
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			expect(result.isError).toBe(true);
+			expect(JSON.parse(result.content[0].text).error).toBe("target_not_at_start");
+		});
+
+		it("returns node_not_at_start when node itself is missing", async () => {
+			mockApi.getNodes.mockResolvedValueOnce({ nodes: {} });
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			expect(result.isError).toBe(true);
+			expect(JSON.parse(result.content[0].text).error).toBe("node_not_at_start");
+		});
+
+		it("attributes property introduction to the correct labeled version (binary search)", async () => {
+			// 4 versions older than start (newest-first):
+			//   v0 (2026-04-01, alice, labeled "v3"): has property
+			//   v1 (2026-03-01, alice, autosave):     has property
+			//   v2 (2026-02-01, bob,   labeled "v2"): does NOT have property  <-- introduction is between v2 and v1
+			//   v3 (2026-01-01, bob,   labeled "v1"): does NOT have property
+			// Expected introduction: v1 (the OLDEST version where target exists)
+			// start has property
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				const v = opts?.version;
+				if (v === "vStart" || v === undefined) return makeNodeResp({ hasProperty: true });
+				if (v === "v0") return makeNodeResp({ hasProperty: true });
+				if (v === "v1") return makeNodeResp({ hasProperty: true });
+				if (v === "v2") return makeNodeResp({ hasProperty: false });
+				if (v === "v3") return makeNodeResp({ hasProperty: false });
+				return { nodes: {} };
+			});
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				makeVersionsList([
+					{ id: "vStart", user: "tj", label: "start_label" },
+					{ id: "v0", user: "alice", label: "v3" },
+					{ id: "v1", user: "alice" },
+					{ id: "v2", user: "bob", label: "v2" },
+					{ id: "v3", user: "bob", label: "v1" },
+				]),
+			);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+				max_versions_to_walk: 50,
+			});
+
+			expect(result.isError).toBeUndefined();
+			const data = JSON.parse(result.content[0].text);
+			expect(data.introduced_at.version_id).toBe("v1");
+			expect(data.introduced_at.user_handle).toBe("alice");
+			expect(data.attribution_certainty).toBe("exact");
+			expect(data.summary.versions_in_search_range).toBe(4);
+			// log2(4) === 2 probes typical, may be 2-3 depending on bias
+			expect(data.summary.probes_made).toBeLessThanOrEqual(3);
+		});
+
+		it("flags system_attributed when the introducing version's user is 'Figma'", async () => {
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				const v = opts?.version;
+				if (v === "vStart" || v === undefined) return makeNodeResp({ hasProperty: true });
+				if (v === "v0") return makeNodeResp({ hasProperty: true });
+				if (v === "v1") return makeNodeResp({ hasProperty: false });
+				return { nodes: {} };
+			});
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				makeVersionsList([
+					{ id: "vStart", user: "tj" },
+					{ id: "v0", user: "Figma" },
+					{ id: "v1", user: "alice" },
+				]),
+			);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.introduced_at.version_id).toBe("v0");
+			expect(data.introduced_at.user_handle).toBe("Figma");
+			expect(data.attribution_certainty).toBe("system_attributed");
+			expect(data.notes.some((n: string) => n.includes("system-triggered autosave"))).toBe(true);
+		});
+
+		it("reports exists_at_lookback_horizon when target exists at oldest scanned", async () => {
+			mockApi.getNodes.mockResolvedValue(makeNodeResp({ hasProperty: true }));
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				makeVersionsList([
+					{ id: "vStart", user: "tj" },
+					{ id: "v0", user: "alice" },
+					{ id: "v1", user: "alice" },
+				]),
+			);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.attribution_certainty).toBe("exists_at_lookback_horizon");
+			expect(data.notes.some((n: string) => n.includes("older than the search range"))).toBe(true);
+		});
+
+		it("attributes to start_version when target is introduced exactly there (no older versions have it)", async () => {
+			// start has it; both candidates don't
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				const v = opts?.version;
+				if (v === "vStart") return makeNodeResp({ hasProperty: true });
+				return makeNodeResp({ hasProperty: false });
+			});
+			// First call: collectCandidateVersions; second: findVersionAuthorMetadata for vStart
+			mockApi.getFileVersions
+				.mockResolvedValueOnce(
+					makeVersionsList([
+						{ id: "vStart", user: "tj", label: "shipped" },
+						{ id: "v0", user: "alice" },
+						{ id: "v1", user: "alice" },
+					]),
+				)
+				.mockResolvedValueOnce(
+					makeVersionsList([
+						{ id: "vStart", user: "tj", label: "shipped" },
+					]),
+				);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.introduced_at.version_id).toBe("vStart");
+			expect(data.introduced_at.user_handle).toBe("tj");
+			expect(data.introduced_at.label).toBe("shipped");
+			expect(data.attribution_certainty).toBe("exact");
+		});
+
+		it("works for child node target type", async () => {
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				const v = opts?.version;
+				if (v === "vStart") return makeNodeResp({ hasChild: true });
+				if (v === "v0") return makeNodeResp({ hasChild: true });
+				if (v === "v1") return makeNodeResp({ hasChild: false });
+				return { nodes: {} };
+			});
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				makeVersionsList([
+					{ id: "vStart", user: "tj" },
+					{ id: "v0", user: "alice", label: "added variant" },
+					{ id: "v1", user: "alice" },
+				]),
+			);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_child_node_id: "999:9",
+				start_version: "vStart",
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			expect(data.target).toEqual({ type: "child_node", node_id: "999:9" });
+			expect(data.introduced_at.version_id).toBe("v0");
+			expect(data.introduced_at.label).toBe("added variant");
+		});
+
+		it("filters autosaves out when include_autosaves=false", async () => {
+			mockApi.getNodes.mockImplementation(async (_fk: string, _ids: string[], opts: any) => {
+				const v = opts?.version;
+				if (v === "vStart") return makeNodeResp({ hasProperty: true });
+				if (v === "vLabeled") return makeNodeResp({ hasProperty: true });
+				return { nodes: {} };
+			});
+			mockApi.getFileVersions.mockResolvedValueOnce(
+				makeVersionsList([
+					{ id: "vStart", user: "tj", label: "start" },
+					{ id: "vAuto1", user: "alice" }, // autosave — filtered
+					{ id: "vAuto2", user: "alice" }, // autosave — filtered
+					{ id: "vLabeled", user: "alice", label: "labeled" },
+				]),
+			);
+
+			const tool = server._getTool("figma_blame_node");
+			const result = await tool.handler({
+				node_id: "100:1",
+				target_component_property: "Disabled#1:2",
+				start_version: "vStart",
+				include_autosaves: false,
+			});
+
+			const data = JSON.parse(result.content[0].text);
+			// Only vLabeled is in the candidate range
+			expect(data.summary.versions_in_search_range).toBe(1);
+			expect(data.introduced_at.version_id).toBe("vLabeled");
 		});
 	});
 });

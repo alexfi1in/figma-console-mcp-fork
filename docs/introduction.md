@@ -193,7 +193,7 @@ Get all 100+ tools including design creation, variable management, and component
 
 ### Cloud Mode (Web AI Clients)
 
-Using Claude.ai, v0, Replit, or Lovable? Get full write access (((83 tools))) without installing Node.js.
+Using Claude.ai, v0, Replit, or Lovable? Get full write access (83 tools) without installing Node.js.
 
 <Steps>
   <Step title="Run the Desktop Bridge Plugin">
@@ -209,7 +209,7 @@ Using Claude.ai, v0, Replit, or Lovable? Get full write access (((83 tools))) wi
 
 ### Remote Mode (Read-Only)
 
-If you just want to explore or evaluate the tool, use Remote Mode. It's read-only (83 tools) but requires zero setup.
+If you just want to explore or evaluate the tool, use Remote Mode. It's read-only (9 tools) but requires zero setup.
 
 <Steps>
   <Step title="Open Claude Desktop Settings">
@@ -221,7 +221,7 @@ If you just want to explore or evaluate the tool, use Remote Mode. It's read-onl
 </Steps>
 
 <Warning>
-**Remote mode without pairing is read-only** (83 tools). For write access from web AI clients, use Cloud Mode above. For full capabilities with real-time monitoring, use NPX Setup.
+**Remote mode without pairing is read-only** (9 tools). For write access from web AI clients, use Cloud Mode above. For full capabilities with real-time monitoring, use NPX Setup.
 </Warning>
 
 <Card title="Full Setup Guide" icon="book-open" href="/setup">

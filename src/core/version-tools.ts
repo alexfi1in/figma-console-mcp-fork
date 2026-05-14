@@ -552,7 +552,8 @@ export function registerVersionTools(
 			const toMeta = extractFileMeta(toFile.data, to_version);
 
 			const notes: string[] = [];
-			if (!component_ids || component_ids.length === 0) {
+			const hasScopedNodes = !!(component_ids && component_ids.length > 0);
+			if (!hasScopedNodes) {
 				notes.push(
 					"Only page-structure diff returned. Pass component_ids to get per-component analysis (added/removed children, property changes, binding changes), or have a node selected in Figma when you call.",
 				);
@@ -562,6 +563,18 @@ export function registerVersionTools(
 					`Auto-scoped to ${component_ids?.length ?? 0} node(s) from the current Figma selection. Pass component_ids explicitly to override.`,
 				);
 			}
+			// Always-on coverage warnings — the failure mode we're guarding against is
+			// the user (or an AI client) believing "no changes found" means "nothing
+			// changed," when in fact the change is in a category this tool doesn't
+			// track. Better to be loud about limits than silently miss real edits.
+			if (hasScopedNodes) {
+				notes.push(
+					"Component-scoped diff covers the canonical components only. INSTANCES of these components placed elsewhere on the canvas (documentation examples, hero frames, mockups) are NOT diffed. For forensic per-session edits including instance changes, use figma_get_design_changes. To diff a specific instance, pass its node ID explicitly.",
+				);
+			}
+			notes.push(
+				"Raw layout/visual properties are NOT tracked. This includes layoutSizingHorizontal/Vertical (hug vs. fill), primaryAxisSizingMode/counterAxisSizingMode, raw paddings/widths/cornerRadius when not bound to a variable, and unbound fills/strokes/effects. This tool surfaces structural deltas (children, property defs, name, description) and variable-BINDING deltas only.",
+			);
 			notes.push(
 				"Variable VALUE history is not retrievable from Figma REST API. Variable definition value changes between these versions are not represented; only binding-reference changes on scoped nodes are detected.",
 			);
@@ -578,7 +591,7 @@ export function registerVersionTools(
 				from: fromMeta,
 				to: toMeta,
 				page_structure: pageDiff,
-				scoped_nodes: component_ids && component_ids.length > 0 ? scoped : undefined,
+				scoped_nodes: hasScopedNodes ? scoped : undefined,
 				summary: {
 					page_changes:
 						pageDiff.summary.added + pageDiff.summary.removed + pageDiff.summary.renamed,
@@ -588,6 +601,34 @@ export function registerVersionTools(
 					used_selection: usedSelection,
 					api_calls_made: apiCalls,
 					cache_hits: cacheHits,
+				},
+				// scope_coverage is an always-on, machine-readable summary of what the
+				// diff DID and DID NOT examine. AI clients should check this before
+				// concluding "nothing else changed." See notes[] for prose warnings.
+				scope_coverage: {
+					page_structure_diffed: true,
+					component_ids_diffed: component_ids ?? [],
+					max_depth: 2,
+					tracks: [
+						"page structure (added/removed/renamed pages)",
+						"component children (added/removed)",
+						"componentPropertyDefinitions (added/removed/type/default)",
+						"name and description changes on scoped nodes",
+						"variable binding references on scoped nodes",
+					],
+					does_not_track: [
+						"instances of components on the canvas (unless passed as component_ids)",
+						"raw layout properties (layoutSizingHorizontal/Vertical, unbound paddings/widths)",
+						"raw visual properties (cornerRadius, unbound fills/strokes/effects, opacity)",
+						"variable VALUE changes (Figma REST does not expose this)",
+						"style content changes (only style add/remove via component reachability)",
+						"comments, annotations, and canvas frame edits outside scoped components",
+					],
+					complementary_tools: [
+						"figma_get_design_changes — forensic per-session edits including raw property changes on instances",
+						"figma_get_variables — current variable state (no history available)",
+						"figma_get_styles — current style state",
+					],
 				},
 				notes,
 				_fetch_errors: fetchErrors.length > 0 ? fetchErrors : undefined,
@@ -686,7 +727,7 @@ export function registerVersionTools(
 	// -----------------------------------------------------------------------
 	server.tool(
 		"figma_diff_versions",
-		"Diff two versions of a Figma file. Always returns a cheap page-structure diff (added/removed/renamed pages, 2 API calls). Pass component_ids to additionally get per-node deep diffs at depth=2 (added/removed children, name/description changes, componentPropertyDefinitions changes for COMPONENT_SETs, boundVariables deltas) — costs 2 API calls per scoped node. Use 'current' for to_version to diff against HEAD. NOTE: variable VALUE history is not retrievable from Figma REST and is not represented in this diff.",
+		"Diff two versions of a Figma file. Always returns a cheap page-structure diff (added/removed/renamed pages, 2 API calls). Pass component_ids to additionally get per-node deep diffs at depth=2 (added/removed children, name/description changes, componentPropertyDefinitions changes for COMPONENT_SETs, boundVariables deltas) — costs 2 API calls per scoped node. Use 'current' for to_version to diff against HEAD. IMPORTANT: This tool surfaces STRUCTURAL deltas (children, property defs) and variable BINDING deltas only. It does NOT track instances of components on the canvas, raw layout properties (layoutSizingHorizontal/Vertical, unbound paddings/widths), raw visual properties (cornerRadius, unbound fills), variable VALUE changes, or style content. See `scope_coverage` and `notes[]` in the response for the full list and complementary tools.",
 		{
 			fileUrl: z
 				.string()

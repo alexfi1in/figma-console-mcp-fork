@@ -625,6 +625,118 @@ describe("Version Tools", () => {
 			expect(secondData.summary.api_calls_made).toBe(0);
 			expect(secondData.summary.cache_hits).toBe(2);
 		});
+
+		// v1.24.0 coverage warnings — guards against the silent blind-spot failure
+		// mode where the diff returns "no changes" but the user changed something
+		// outside the tool's coverage (instance overrides, raw layout properties).
+		describe("scope_coverage (v1.24.0)", () => {
+			const flatFileResp = () => ({
+				document: { id: "0:0", name: "Document", type: "DOCUMENT", children: [] },
+				version: "VFOO",
+				lastModified: "2026-05-01T00:00:00Z",
+				thumbnailUrl: "https://example.com/thumb.png",
+			});
+
+			it("always emits the raw-layout-properties warning in notes[]", async () => {
+				mockApi.getFile.mockResolvedValue(flatFileResp());
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+				const data = JSON.parse(result.content[0].text);
+				expect(
+					data.notes.some((n: string) =>
+						n.includes("Raw layout/visual properties are NOT tracked"),
+					),
+				).toBe(true);
+			});
+
+			it("emits the instances-not-diffed warning only when component_ids are scoped", async () => {
+				mockApi.getFile.mockResolvedValue(flatFileResp());
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"1:1": {
+							document: { id: "1:1", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+
+				const tool = server._getTool("figma_diff_versions");
+
+				// Unscoped: no instance warning (the user can't have meant instances)
+				const unscoped = await tool.handler({ from_version: "vA", to_version: "vB" });
+				const unscopedData = JSON.parse(unscoped.content[0].text);
+				expect(
+					unscopedData.notes.some((n: string) =>
+						n.includes("INSTANCES of these components"),
+					),
+				).toBe(false);
+
+				// Scoped: instance warning fires
+				const scoped = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["1:1"],
+				});
+				const scopedData = JSON.parse(scoped.content[0].text);
+				expect(
+					scopedData.notes.some((n: string) => n.includes("INSTANCES of these components")),
+				).toBe(true);
+			});
+
+			it("includes a structured scope_coverage object on every response", async () => {
+				mockApi.getFile.mockResolvedValue(flatFileResp());
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+				const data = JSON.parse(result.content[0].text);
+
+				expect(data.scope_coverage).toBeDefined();
+				expect(data.scope_coverage.page_structure_diffed).toBe(true);
+				expect(data.scope_coverage.component_ids_diffed).toEqual([]);
+				expect(data.scope_coverage.max_depth).toBe(2);
+				expect(Array.isArray(data.scope_coverage.tracks)).toBe(true);
+				expect(Array.isArray(data.scope_coverage.does_not_track)).toBe(true);
+				expect(Array.isArray(data.scope_coverage.complementary_tools)).toBe(true);
+
+				// Specifically: the four most important blind spots must be named.
+				const blindspots = data.scope_coverage.does_not_track.join(" ");
+				expect(blindspots).toMatch(/instances/i);
+				expect(blindspots).toMatch(/raw layout/i);
+				expect(blindspots).toMatch(/raw visual/i);
+				expect(blindspots).toMatch(/variable value/i);
+
+				// Complementary tools the AI should reach for when this tool comes back empty.
+				const tools = data.scope_coverage.complementary_tools.join(" ");
+				expect(tools).toContain("figma_get_design_changes");
+				expect(tools).toContain("figma_get_variables");
+			});
+
+			it("populates scope_coverage.component_ids_diffed when component_ids are passed", async () => {
+				mockApi.getFile.mockResolvedValue(flatFileResp());
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"4271:9562": {
+							document: { id: "4271:9562", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["4271:9562"],
+				});
+				const data = JSON.parse(result.content[0].text);
+				expect(data.scope_coverage.component_ids_diffed).toEqual(["4271:9562"]);
+			});
+
+			it("scope_coverage propagates through figma_get_changes_since_version", async () => {
+				mockApi.getFile.mockResolvedValue(flatFileResp());
+				const tool = server._getTool("figma_get_changes_since_version");
+				const result = await tool.handler({ since_version: "vA" });
+				const data = JSON.parse(result.content[0].text);
+				expect(data.scope_coverage).toBeDefined();
+				expect(data.scope_coverage.max_depth).toBe(2);
+			});
+		});
 	});
 
 	// -----------------------------------------------------------------------

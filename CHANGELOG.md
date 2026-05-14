@@ -5,6 +5,31 @@ All notable changes to Figma Console MCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.0] - 2026-05-13
+
+Honest scope coverage on version diffs. v1.23.0 already flagged variable VALUE history as a known blind spot in `notes[]`, but two other categories of change were silently invisible: **instances of components placed on the canvas** (documentation examples, hero frames, mockups) and **raw layout/visual properties** that aren't bound to variables (`layoutSizingHorizontal`, unbound paddings, `cornerRadius`, etc.). When the diff returned `change_count: 0` on a scoped node, an AI client had no way to know whether that meant "nothing changed" or "something changed in a category I don't see." That silent failure mode burned an entire investigation in our own demo. This release makes the limits loud — every response now carries always-on coverage warnings and a structured `scope_coverage` object.
+
+### Added
+
+- Always-on `notes[]` warnings in `figma_diff_versions`, `figma_get_changes_since_version`, and `figma_generate_changelog` responses:
+  - "**Raw layout/visual properties are NOT tracked**" — fires on every response. Calls out `layoutSizingHorizontal/Vertical` (hug vs. fill), `primaryAxisSizingMode`/`counterAxisSizingMode`, raw paddings/widths/`cornerRadius` when not bound, and unbound fills/strokes/effects.
+  - "**Component-scoped diff covers the canonical components only. INSTANCES of these components placed elsewhere on the canvas are NOT diffed**" — fires whenever `component_ids` are passed (explicitly or via selection fallback). Names `figma_get_design_changes` as the complementary forensic tool.
+- New `scope_coverage` object in every diff response — machine-readable summary of what the diff DID and DID NOT examine:
+  - `page_structure_diffed`, `component_ids_diffed`, `max_depth`
+  - `tracks[]` — the 5 change categories surfaced (page structure, children, property defs, name/description, variable bindings)
+  - `does_not_track[]` — the 6 known blind spots (instances, raw layout, raw visual, variable values, style content, comments/annotations)
+  - `complementary_tools[]` — `figma_get_design_changes`, `figma_get_variables`, `figma_get_styles` mapped to the blind spots they cover
+- Tool descriptions for `figma_diff_versions` updated with an `IMPORTANT:` callout pointing to `scope_coverage` and `notes[]` so AI clients see the limits at tool-selection time, not just in the response.
+
+### Changed
+
+- `figma_diff_versions` description rewritten to be explicit about what's tracked (structural + binding deltas) vs. what isn't, replacing the previous single-line variable-history caveat.
+
+### Fixed
+
+- Silent blind spot: a component-scoped diff that returned `change_count: 0` while a real edit existed on an instance of that component or on a raw layout property used to look identical to "no changes anywhere." It now always tells you what wasn't checked, in both prose (`notes[]`) and structured form (`scope_coverage`).
+
+
 ## [1.23.0] - 2026-05-09
 
 Time-series awareness for design files. Six new tools that turn a Figma file from a static snapshot into a queryable history — list versions, snapshot any past version, diff two versions for added/removed/modified components and binding deltas, generate human-readable markdown changelogs, and trace exactly when (and by whom) a specific component property or variant was introduced via a binary-search blame walker. All composable, all cache-aware (~log₂(N) probes for blame, repeat queries on the same range nearly free), all honest about Figma REST API limits in `notes[]` responses.
@@ -674,6 +699,7 @@ Connection health protocol — agents no longer need custom health-check logic t
 - Real-time Figma Desktop Bridge plugin
 - Support for both local (stdio) and Cloudflare Workers deployment
 
+[1.24.0]: https://github.com/southleft/figma-console-mcp/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/southleft/figma-console-mcp/compare/v1.22.4...v1.23.0
 [1.22.4]: https://github.com/southleft/figma-console-mcp/compare/v1.22.3...v1.22.4
 [1.22.3]: https://github.com/southleft/figma-console-mcp/compare/v1.22.1...v1.22.3

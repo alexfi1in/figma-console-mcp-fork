@@ -737,6 +737,233 @@ describe("Version Tools", () => {
 				expect(data.scope_coverage.max_depth).toBe(2);
 			});
 		});
+
+		// v1.25.0: metadata buffer integration — description and annotation changes
+		// captured by the Desktop Bridge plugin should surface in the diff response
+		// when the time window overlaps with buffer entries.
+		describe("metadata buffer (v1.25.0)", () => {
+			const datedFileResp = (lastModified: string) => ({
+				document: { id: "0:0", name: "Document", type: "DOCUMENT", children: [] },
+				version: "VFOO",
+				lastModified,
+				thumbnailUrl: "https://example.com/thumb.png",
+			});
+
+			// Helper: register a fresh server with a metadata getter that returns
+			// a hand-rolled buffer. Mirrors the existing `beforeEach` pattern.
+			const registerWithBuffer = (buffer: any[]) => {
+				server = createMockServer();
+				mockApi = createMockFigmaAPI();
+				registerVersionTools(
+					server as any,
+					async () => mockApi as any,
+					() => MOCK_FILE_URL,
+					undefined,
+					undefined,
+					(opts) =>
+						buffer.filter((e) => {
+							if (opts.since !== undefined && e.timestamp < opts.since) return false;
+							if (opts.until !== undefined && e.timestamp > opts.until) return false;
+							return true;
+						}),
+				);
+			};
+
+			it("scope_coverage.metadata_buffer reports available:false when no getter wired", async () => {
+				// Use the outer beforeEach server (no getter wired)
+				mockApi.getFile.mockResolvedValue(datedFileResp("2026-05-01T00:00:00Z"));
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+				const data = JSON.parse(result.content[0].text);
+				expect(data.scope_coverage.metadata_buffer.available).toBe(false);
+				expect(data.scope_coverage.does_not_track.join(" ")).toMatch(
+					/component descriptions.*no plugin buffer wired/i,
+				);
+			});
+
+			it("scope_coverage.metadata_buffer reports available:true with 0 entries when buffer is empty", async () => {
+				registerWithBuffer([]);
+				mockApi.getFile.mockResolvedValue(datedFileResp("2026-05-01T00:00:00Z"));
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({ from_version: "vA", to_version: "vB" });
+				const data = JSON.parse(result.content[0].text);
+				expect(data.scope_coverage.metadata_buffer).toEqual({
+					available: true,
+					entries_in_window: 0,
+					entries_matched_to_scoped_nodes: 0,
+					entries_outside_scope: 0,
+				});
+				expect(data.scope_coverage.tracks.join(" ")).toMatch(
+					/component descriptions via plugin session buffer/i,
+				);
+				expect(data.notes.some((n: string) => n.includes("No description or annotation changes"))).toBe(true);
+			});
+
+			it("attaches buffer events to a matching scoped node under metadata_changes", async () => {
+				const t0 = Date.parse("2026-05-01T00:00:00Z");
+				const t1 = Date.parse("2026-05-01T00:05:00Z");
+				registerWithBuffer([
+					{
+						node_id: "4271:9562",
+						node_name: "Button",
+						node_type: "COMPONENT_SET",
+						field: "description",
+						new_value: "Updated docs about loading state",
+						timestamp: t0 + 60_000,
+					},
+					{
+						node_id: "4271:9562",
+						node_name: "Button",
+						node_type: "COMPONENT_SET",
+						field: "annotations",
+						new_value: [{ label: "Use Primary for hero CTAs", categoryId: null, properties: [] }],
+						timestamp: t0 + 120_000,
+					},
+				]);
+				mockApi.getFile
+					.mockResolvedValueOnce(datedFileResp(new Date(t0).toISOString()))
+					.mockResolvedValueOnce(datedFileResp(new Date(t1).toISOString()));
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"4271:9562": {
+							document: { id: "4271:9562", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["4271:9562"],
+				});
+				const data = JSON.parse(result.content[0].text);
+
+				expect(data.scoped_nodes[0].metadata_changes).toHaveLength(2);
+				expect(data.scoped_nodes[0].metadata_changes[0]).toMatchObject({
+					field: "description",
+					source: "plugin_buffer",
+				});
+				expect(data.scoped_nodes[0].metadata_changes[1]).toMatchObject({
+					field: "annotations",
+					source: "plugin_buffer",
+				});
+				// Buffer matches roll into change_count so summary stats reflect them
+				expect(data.scoped_nodes[0].change_count).toBeGreaterThanOrEqual(2);
+				expect(data.scope_coverage.metadata_buffer.entries_in_window).toBe(2);
+				expect(data.scope_coverage.metadata_buffer.entries_matched_to_scoped_nodes).toBe(2);
+				expect(data.scope_coverage.metadata_buffer.entries_outside_scope).toBe(0);
+			});
+
+			it("surfaces unscoped buffer events under unscoped_metadata_changes", async () => {
+				const t0 = Date.parse("2026-05-01T00:00:00Z");
+				const t1 = Date.parse("2026-05-01T00:05:00Z");
+				registerWithBuffer([
+					{
+						node_id: "999:999", // NOT in component_ids
+						node_name: "Card",
+						node_type: "COMPONENT_SET",
+						field: "description",
+						new_value: "Card got a docstring",
+						timestamp: t0 + 30_000,
+					},
+				]);
+				mockApi.getFile
+					.mockResolvedValueOnce(datedFileResp(new Date(t0).toISOString()))
+					.mockResolvedValueOnce(datedFileResp(new Date(t1).toISOString()));
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"4271:9562": {
+							document: { id: "4271:9562", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["4271:9562"],
+				});
+				const data = JSON.parse(result.content[0].text);
+
+				expect(data.unscoped_metadata_changes).toHaveLength(1);
+				expect(data.unscoped_metadata_changes[0]).toMatchObject({
+					node_id: "999:999",
+					field: "description",
+					source: "plugin_buffer",
+				});
+				expect(data.scoped_nodes[0].metadata_changes).toBeUndefined();
+				expect(data.scope_coverage.metadata_buffer.entries_outside_scope).toBe(1);
+			});
+
+			it("respects the time window — events outside [from, to] are excluded", async () => {
+				const t0 = Date.parse("2026-05-01T00:00:00Z");
+				const t1 = Date.parse("2026-05-01T00:05:00Z");
+				registerWithBuffer([
+					// Before window
+					{ node_id: "4271:9562", field: "description", new_value: "old", timestamp: t0 - 60_000 },
+					// In window
+					{ node_id: "4271:9562", field: "description", new_value: "mid", timestamp: t0 + 60_000 },
+					// After window
+					{ node_id: "4271:9562", field: "description", new_value: "new", timestamp: t1 + 60_000 },
+				]);
+				mockApi.getFile
+					.mockResolvedValueOnce(datedFileResp(new Date(t0).toISOString()))
+					.mockResolvedValueOnce(datedFileResp(new Date(t1).toISOString()));
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"4271:9562": {
+							document: { id: "4271:9562", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+
+				const tool = server._getTool("figma_diff_versions");
+				const result = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["4271:9562"],
+				});
+				const data = JSON.parse(result.content[0].text);
+
+				expect(data.scope_coverage.metadata_buffer.entries_in_window).toBe(1);
+				expect(data.scoped_nodes[0].metadata_changes).toHaveLength(1);
+				expect(data.scoped_nodes[0].metadata_changes[0].new_value).toBe("mid");
+			});
+
+			it("metadata buffer integration propagates through figma_generate_changelog", async () => {
+				const t0 = Date.parse("2026-05-01T00:00:00Z");
+				const t1 = Date.parse("2026-05-01T00:05:00Z");
+				registerWithBuffer([
+					{
+						node_id: "4271:9562",
+						field: "description",
+						new_value: "Loading state docs",
+						timestamp: t0 + 60_000,
+					},
+				]);
+				mockApi.getFile
+					.mockResolvedValueOnce(datedFileResp(new Date(t0).toISOString()))
+					.mockResolvedValueOnce(datedFileResp(new Date(t1).toISOString()));
+				mockApi.getNodes.mockResolvedValue({
+					nodes: {
+						"4271:9562": {
+							document: { id: "4271:9562", name: "Button", type: "COMPONENT_SET", children: [] },
+						},
+					},
+				});
+
+				const tool = server._getTool("figma_generate_changelog");
+				const result = await tool.handler({
+					from_version: "vA",
+					to_version: "vB",
+					component_ids: ["4271:9562"],
+				});
+				const parsed = JSON.parse(result.content[0].text);
+				expect(parsed.structured.scoped_nodes[0].metadata_changes).toHaveLength(1);
+			});
+		});
 	});
 
 	// -----------------------------------------------------------------------

@@ -5,6 +5,36 @@ All notable changes to Figma Console MCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.0] - 2026-05-13
+
+Description and Dev Mode annotation changes are now first-class citizens in `figma_diff_versions`. v1.23.0 introduced version diffs but Figma's REST API never returns COMPONENT_SET descriptions or annotations in version snapshots — meaning every description edit and every annotation edit was silently invisible to the diff engine. For design-system teams who rely on descriptions and annotations to communicate intent, this was the most important category of change being missed.
+
+This release closes the gap by capturing those edits via the Desktop Bridge plugin's `documentchange` listener, forwarding them over WebSocket into a per-file ring buffer on the MCP server, and merging them into the diff response by correlating the buffer's timestamps with the version time window. When the plugin is connected during an edit, descriptions and annotations now appear under `scoped_nodes[].metadata_changes[]` (when the changed node matches a `component_ids` scope) or `unscoped_metadata_changes[]` (when it doesn't). Both views carry a `source: "plugin_buffer"` marker so callers can distinguish REST-driven from plugin-captured changes.
+
+The honesty principle from v1.24.0 still holds: `scope_coverage.metadata_buffer` reports whether the buffer is `available` at all and how many entries fell inside the time window. When the plugin wasn't connected during an edit, the buffer simply won't have those events — `notes[]` warns about this explicitly so the AI knows what it might be missing.
+
+### Added
+
+- **`scoped_nodes[].metadata_changes[]`** — description and annotation edits captured by the plugin, surfaced per scoped component. Each entry has `field` (`"description" | "annotations"`), `new_value`, `timestamp` (Unix ms), and `source: "plugin_buffer"`. Buffer matches contribute to the node's `change_count`, so summary stats stay consistent.
+- **`unscoped_metadata_changes[]`** — same shape, for events whose `node_id` didn't match any requested `component_ids`. Prevents the buffer from silently dropping captured events when the caller's scope is narrow.
+- **`scope_coverage.metadata_buffer`** — structured status object: `{ available, entries_in_window, entries_matched_to_scoped_nodes, entries_outside_scope }`. AI clients can branch on `available: false` to know they're in REST-only mode.
+- **Plugin-side `METADATA_CHANGE` event** in `figma-desktop-bridge/code.js` — `figma.on('documentchange')` detects `PROPERTY_CHANGE` events touching `description`, `descriptionMarkdown`, or `annotations`, captures the new value (with annotations serialized to JSON-safe form), and posts to the UI. Forwarded over WebSocket by `ui.html`.
+- **Server-side metadata buffer** in `src/core/websocket-server.ts` — new `MetadataChangeEntry` interface, per-`ClientConnection` ring buffer (size matches `documentChangeBufferSize`), `METADATA_CHANGE` message handler, and `getMetadataChanges({ fileKey, since, until, nodeIds })` reader API. Emits a `metadataChange` event for downstream subscribers.
+- **6 new jest tests** under `metadata buffer (v1.25.0)` in `tests/version-tools.test.ts` — assertions for: available-false fallback when no getter wired, available-true empty-window case, scoped-match attachment, unscoped surfacing, time-window filtering, and propagation through `figma_generate_changelog`. Total suite: 1101 passing across 36 suites (up from 1095).
+
+### Changed
+
+- `scope_coverage.tracks[]` now lists "component descriptions via plugin session buffer" and "Dev Mode annotations via plugin session buffer" when the buffer is available; `does_not_track[]` correspondingly drops "comments, annotations" from its previous entry and adds either "description/annotation edits made while the Desktop Bridge plugin was disconnected" (buffer wired) or the full REST-omission caveats (buffer not wired).
+- `scope_coverage.complementary_tools[]` adds `figma_get_component` for live description/annotation state on a single node.
+- `figma_diff_versions` tool description rewritten to mention metadata buffer capability up front, so AI clients know to expect description and annotation visibility.
+- `notes[]` in every diff response now includes a metadata-buffer status line — either "tracked when plugin was connected" + caveat, "buffer empty in this window," or "not tracked (no buffer wired)."
+- Plugin `PLUGIN_VERSION` bumped to `1.25.0`. **Re-import the plugin manifest in Figma to pick up the new code.js / ui.html.**
+
+### Fixed
+
+- The silent description/annotation blind spot in `figma_diff_versions`. Empirical verification (this release's commit) confirmed Figma's REST `/v1/files/:key/nodes?version=…` endpoint returns `description: ""` for COMPONENT_SET nodes at every version, regardless of what the Plugin API reports. The new plugin-buffer pipeline is the only practical way to surface these changes without waiting for the user to publish a library.
+
+
 ## [1.24.0] - 2026-05-13
 
 Honest scope coverage on version diffs. v1.23.0 already flagged variable VALUE history as a known blind spot in `notes[]`, but two other categories of change were silently invisible: **instances of components placed on the canvas** (documentation examples, hero frames, mockups) and **raw layout/visual properties** that aren't bound to variables (`layoutSizingHorizontal`, unbound paddings, `cornerRadius`, etc.). When the diff returned `change_count: 0` on a scoped node, an AI client had no way to know whether that meant "nothing changed" or "something changed in a category I don't see." That silent failure mode burned an entire investigation in our own demo. This release makes the limits loud — every response now carries always-on coverage warnings and a structured `scope_coverage` object.
@@ -699,6 +729,7 @@ Connection health protocol — agents no longer need custom health-check logic t
 - Real-time Figma Desktop Bridge plugin
 - Support for both local (stdio) and Cloudflare Workers deployment
 
+[1.25.0]: https://github.com/southleft/figma-console-mcp/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/southleft/figma-console-mcp/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/southleft/figma-console-mcp/compare/v1.22.4...v1.23.0
 [1.22.4]: https://github.com/southleft/figma-console-mcp/compare/v1.22.3...v1.22.4
